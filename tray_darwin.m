@@ -1,19 +1,32 @@
 #include <Cocoa/Cocoa.h>
+#include <Carbon/Carbon.h>
 
-extern void goTrayToggle();
-extern void goTrayQuit();
+extern void goAutoConvertToggle(void);
+extern void goTrayQuit(void);
 
 static NSStatusItem *statusItem = nil;
 static NSMenu *statusMenu = nil;
+static NSMenuItem *autoConvertItem = nil;
+
+// Mirror of the Go-side autoConvertEnabled atomic. Updated only via
+// updateAutoConvertMenu so the menu checkmark and the in-process flag
+// stay in sync. We need a C-level mirror because ensureApp() may rebuild
+// the menu after updateAutoConvertMenu has already been called once at
+// startup with the persisted config value.
+static int autoConvertOn = 1;
+
+@class LayoutObserver;
+static LayoutObserver *layoutObserver = nil;
+static void setTrayTitleFromCurrentLayout(void);
 
 @interface TrayDelegate : NSObject
-- (void)toggleAction:(id)sender;
+- (void)autoConvertAction:(id)sender;
 - (void)quitAction:(id)sender;
 @end
 
 @implementation TrayDelegate
-- (void)toggleAction:(id)sender {
-    goTrayToggle();
+- (void)autoConvertAction:(id)sender {
+    goAutoConvertToggle();
 }
 - (void)quitAction:(id)sender {
     goTrayQuit();
@@ -22,44 +35,46 @@ static NSMenu *statusMenu = nil;
 
 static TrayDelegate *delegate = nil;
 
-void createTray(int enabled) {
+@interface LayoutObserver : NSObject
+- (void)layoutChanged:(NSNotification *)note;
+@end
+
+@implementation LayoutObserver
+- (void)layoutChanged:(NSNotification *)note {
+    setTrayTitleFromCurrentLayout();
+}
+@end
+
+// setTrayTitleFromCurrentLayout reads the current keyboard input source
+// (via TIS) and sets the tray title to the matching flag emoji. Always
+// dispatches the UI mutation onto the main queue so it is safe to call
+// from notification callbacks delivered on background threads.
+static void setTrayTitleFromCurrentLayout(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!delegate) {
-            delegate = [[TrayDelegate alloc] init];
+        if (!statusItem || !statusItem.button) return;
+
+        TISInputSourceRef src = TISCopyCurrentKeyboardInputSource();
+        BOOL isRussian = NO;
+        if (src) {
+            CFStringRef sid = TISGetInputSourceProperty(src, kTISPropertyInputSourceID);
+            if (sid) {
+                CFRange r = CFStringFind(sid, CFSTR("Russian"), kCFCompareCaseInsensitive);
+                if (r.location != kCFNotFound) isRussian = YES;
+            }
+            CFRelease(src);
         }
-
-        statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-        statusItem.button.title = enabled ? @"⌨ RU" : @"⌨ ⏸";
-        statusItem.button.font = [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightMedium];
-
-        statusMenu = [[NSMenu alloc] init];
-
-        NSMenuItem *toggleItem = [[NSMenuItem alloc] initWithTitle:(enabled ? @"⏸ Приостановить" : @"▶ Включить")
-                                                           action:@selector(toggleAction:)
-                                                    keyEquivalent:@""];
-        toggleItem.target = delegate;
-        [statusMenu addItem:toggleItem];
-
-        [statusMenu addItem:[NSMenuItem separatorItem]];
-
-        NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Выйти"
-                                                         action:@selector(quitAction:)
-                                                  keyEquivalent:@"q"];
-        quitItem.target = delegate;
-        [statusMenu addItem:quitItem];
-
-        statusItem.menu = statusMenu;
+        statusItem.button.title = isRussian ? @"🇷🇺" : @"🇺🇸";
     });
 }
 
-void updateTray(int enabled) {
+// updateAutoConvertMenu syncs the tray menu checkmark with the Go-side
+// flag. Safe to call before the menu exists (guarded against nil).
+void updateAutoConvertMenu(int enabled) {
+    autoConvertOn = enabled;
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (statusItem) {
-            statusItem.button.title = enabled ? @"⚡" : @"💤";
-        }
-        if (statusMenu && [statusMenu numberOfItems] > 0) {
-            NSMenuItem *toggle = [statusMenu itemAtIndex:0];
-            toggle.title = enabled ? @"⏸ Приостановить" : @"▶ Включить";
+        if (autoConvertItem) {
+            autoConvertItem.state = enabled ? NSControlStateValueOn
+                                            : NSControlStateValueOff;
         }
     });
 }
@@ -77,37 +92,73 @@ void ensureApp(void) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
-    // Create tray synchronously on main thread
     if (!delegate) {
         delegate = [[TrayDelegate alloc] init];
     }
 
-    statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    statusItem.button.title = @"⚡";  // active: vzhuh!
+    statusItem = [[NSStatusBar systemStatusBar]
+        statusItemWithLength:NSVariableStatusItemLength];
+    // System font at 14pt; Apple Color Emoji fallback renders the regional
+    // indicator pair as a single flag glyph.
     statusItem.button.font = [NSFont systemFontOfSize:14];
+
+    // Initial probe — keep the first paint correct without waiting for
+    // the layout-change notification to fire.
+    {
+        TISInputSourceRef src = TISCopyCurrentKeyboardInputSource();
+        BOOL isRussian = NO;
+        if (src) {
+            CFStringRef sid = TISGetInputSourceProperty(src, kTISPropertyInputSourceID);
+            if (sid) {
+                CFRange r = CFStringFind(sid, CFSTR("Russian"), kCFCompareCaseInsensitive);
+                if (r.location != kCFNotFound) isRussian = YES;
+            }
+            CFRelease(src);
+        }
+        statusItem.button.title = isRussian ? @"🇷🇺" : @"🇺🇸";
+    }
 
     statusMenu = [[NSMenu alloc] init];
 
-    NSMenuItem *toggleItem = [[NSMenuItem alloc] initWithTitle:@"⏸ Приостановить"
-                                                       action:@selector(toggleAction:)
-                                                keyEquivalent:@""];
-    toggleItem.target = delegate;
-    [statusMenu addItem:toggleItem];
+    autoConvertItem = [[NSMenuItem alloc] initWithTitle:@"Автоконвертация"
+                                                 action:@selector(autoConvertAction:)
+                                          keyEquivalent:@""];
+    autoConvertItem.target = delegate;
+    autoConvertItem.state = autoConvertOn ? NSControlStateValueOn
+                                          : NSControlStateValueOff;
+    [statusMenu addItem:autoConvertItem];
 
     [statusMenu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Выйти"
-                                                     action:@selector(quitAction:)
-                                              keyEquivalent:@"q"];
+                                                      action:@selector(quitAction:)
+                                               keyEquivalent:@"q"];
     quitItem.target = delegate;
     [statusMenu addItem:quitItem];
 
-    // Standard menu on any click
     statusItem.menu = statusMenu;
+
+    // Subscribe to keyboard layout changes. The TIS notification is the
+    // canonical signal; we also register the AppleSelectedInputSources
+    // legacy name in case it is delivered first in some app contexts.
+    if (!layoutObserver) {
+        layoutObserver = [[LayoutObserver alloc] init];
+    }
+    NSDistributedNotificationCenter *dnc =
+        [NSDistributedNotificationCenter defaultCenter];
+    [dnc addObserver:layoutObserver
+            selector:@selector(layoutChanged:)
+                name:(NSString *)kTISNotifySelectedKeyboardInputSourceChanged
+              object:nil];
+    [dnc addObserver:layoutObserver
+            selector:@selector(layoutChanged:)
+                name:@"AppleSelectedInputSourcesChangedNotification"
+              object:nil];
 }
 
 void runNSApp(void) {
-    // Use [NSApp run] — the standard way. This processes menu events correctly.
-    // CGEventTap runs on its own thread via startHook(), so no conflict.
+    // Use [NSApp run] — the standard way. This processes menu events
+    // correctly. CGEventTap runs on its own thread via startHook(), so no
+    // conflict.
     [NSApp run];
 }

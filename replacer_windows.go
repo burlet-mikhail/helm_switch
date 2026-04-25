@@ -9,19 +9,19 @@ import (
 )
 
 var (
-	procSendInput             = user32.NewProc("SendInput")
+	procSendInput              = user32.NewProc("SendInput")
 	procActivateKeyboardLayout = user32.NewProc("ActivateKeyboardLayout")
 	procGetKeyboardLayoutList  = user32.NewProc("GetKeyboardLayoutList")
-	procPostMessage           = user32.NewProc("PostMessageW")
+	procPostMessage            = user32.NewProc("PostMessageW")
 )
 
 const (
-	INPUT_KEYBOARD    = 1
-	KEYEVENTF_KEYUP   = 0x0002
-	KEYEVENTF_UNICODE = 0x0004
+	INPUT_KEYBOARD            = 1
+	KEYEVENTF_KEYUP           = 0x0002
+	KEYEVENTF_UNICODE         = 0x0004
 	WM_INPUTLANGCHANGEREQUEST = 0x0050
-	HWND_BROADCAST = 0xFFFF
-	HKL_NEXT       = 1
+	HWND_BROADCAST            = 0xFFFF
+	HKL_NEXT                  = 1
 )
 
 type INPUT struct {
@@ -105,9 +105,10 @@ func FrontmostAppID() string {
 }
 
 // Tray stubs for Windows (TODO: implement Win32 tray icon)
-func startTray()          {}
-func runAppLoop()         { select {} }
-func isTrayEnabled() bool { return true }
+func startTray()                   {}
+func runAppLoop()                  { select {} }
+func isAutoConvertEnabled() bool   { return true }
+func setAutoConvertEnabled(_ bool) {}
 
 // installFrontmostObserver — no-op on Windows (FrontmostAppID uses direct call)
 func installFrontmostObserver() {}
