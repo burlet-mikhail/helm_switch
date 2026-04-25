@@ -75,6 +75,21 @@ func (b *Buffer) FlushWord() string {
 	return word
 }
 
+// LastWord returns the current buffered word WITHOUT mutating or flushing
+// the buffer. Used by the convert-last-word hotkey so that repeated
+// presses keep observing the same word until a real keystroke arrives.
+// Returns "" when the buffer is empty.
+func (b *Buffer) LastWord() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.chars) == 0 {
+		return ""
+	}
+	// string(b.chars) copies the underlying runes, so the returned value
+	// is safe to use after we release b.mu and even if b.chars mutates.
+	return string(b.chars)
+}
+
 func isWordBoundary(r rune) bool {
 	if unicode.IsSpace(r) {
 		return true

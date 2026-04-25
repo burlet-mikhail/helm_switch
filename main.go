@@ -22,12 +22,7 @@ const (
 	macBackspace = 0x33
 	macReturn    = 0x24
 	macEnter     = 0x4C // numpad enter
-	macZ         = 0x06 // Z key
-	macX         = 0x07 // X key
-	macC         = 0x08 // C key
-	macV         = 0x09 // V key
-
-	kCGEventFlagMaskShift = 1 << 17
+	macZ         = 0x06 // Z key (still used by the Cmd+Z undo handler)
 )
 
 // lastReplace stores the last replacement for undo
@@ -57,6 +52,46 @@ func (u *undoState) Get() (original, replaced string, ok bool) {
 	orig, repl := u.original, u.replaced
 	u.original = "" // consume — one undo only
 	return orig, repl, true
+}
+
+// lastWordState tracks the most recent convert_last_word conversion so a
+// repeated press of the hotkey can toggle back to the original word. The
+// toggle window is invalidated by any non-modifier real keystroke (regular
+// chars and backspace) — see Task 10 callsites in onKeyEvent.
+type lastWordState struct {
+	mu        sync.Mutex
+	original  string // word as the user typed it (pre-conversion)
+	converted string // what we typed instead
+	active    bool   // true if the next hotkey press should toggle back
+}
+
+var lastWord lastWordState
+
+// Set records a fresh conversion and arms the toggle-back window.
+func (l *lastWordState) Set(original, converted string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.original = original
+	l.converted = converted
+	l.active = true
+}
+
+// Reset clears the toggle-back window. Called by the toggle-back path after
+// reverting and by any real keystroke handler that signals "buffer changed".
+func (l *lastWordState) Reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.original = ""
+	l.converted = ""
+	l.active = false
+}
+
+// Snapshot returns the current state under the mutex so callers can act on a
+// consistent view without holding the lock during long operations.
+func (l *lastWordState) Snapshot() (original, converted string, active bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.original, l.converted, l.active
 }
 
 // looksLikeContext returns true if the word looks like a URL, email, file path,
@@ -213,6 +248,13 @@ func main() {
 		return
 	}
 
+	// Parse hotkeys once at startup. Invalid specs fall back to defaults
+	// (Cmd+Shift+X / Cmd+Shift+Z) with a logged warning — handled inside
+	// ParsedHotkeys.
+	selectionHotkey, lastWordHotkey := cfg.ParsedHotkeys()
+	log.Printf("Hotkeys: convert_selection=%s convert_last_word=%s",
+		cfg.Hotkeys.ConvertSelection, cfg.Hotkeys.ConvertLastWord)
+
 	// Exceptions store + rollback tracker — learning from user corrections.
 	// Store failures are non-fatal: we fall back to no-learning mode.
 	store, err := NewExceptionStore()
@@ -249,7 +291,7 @@ func main() {
 	// Create buffer with word callback (for space and other non-Enter boundaries)
 	var buf *Buffer
 	buf = NewBuffer(func(word string) {
-		if !cfg.Enabled || atomic.LoadInt32(&replacing) == 1 || !isTrayEnabled() {
+		if !cfg.Enabled || atomic.LoadInt32(&replacing) == 1 || !isAutoConvertEnabled() {
 			return
 		}
 
@@ -297,17 +339,107 @@ func main() {
 		}
 	})
 
+	// Modifier mask covering all four "real" modifiers — used by the
+	// convert_last_word handler to ensure no extra modifier (besides those
+	// required by the configured hotkey) is held. Without this, e.g. plain
+	// Cmd+Z (no Shift) would be misclassified when the configured hotkey
+	// is Cmd+Shift+Z.
+	const allModsMask = hotkeyFlagCommand | hotkeyFlagShift | hotkeyFlagControl | hotkeyFlagAlt
+
 	// Set up key event handler — called synchronously from CGEventTap
 	onKeyEvent = func(keycode uint16, char rune, flags int64) bool {
-		if !cfg.Enabled || !isTrayEnabled() {
+		// convert_last_word hotkey is checked BEFORE the cfg.Enabled /
+		// auto-convert gate (so it still works when auto-convert is off)
+		// AND before the Cmd+Z undo branch (so Cmd+Shift+Z is consumed
+		// here and never reaches undo).
+		if keycode == lastWordHotkey.KeyCode &&
+			(flags&lastWordHotkey.Modifiers) == lastWordHotkey.Modifiers &&
+			(flags & ^lastWordHotkey.Modifiers & allModsMask) == 0 {
+
+			origPrev, convPrev, active := lastWord.Snapshot()
+			current := buf.LastWord()
+
+			if active {
+				// Toggle-back path: revert convPrev → origPrev.
+				go func() {
+					atomic.StoreInt32(&replacing, 1)
+					buf.Clear()
+					for range convPrev {
+						sendBackspaceKey()
+						time.Sleep(5 * time.Millisecond)
+					}
+					time.Sleep(10 * time.Millisecond)
+					for _, ch := range origPrev {
+						sendChar(ch)
+						time.Sleep(5 * time.Millisecond)
+					}
+					switchLang()
+					time.Sleep(30 * time.Millisecond)
+					// Toggling back ends the toggle window — a subsequent
+					// press must re-convert from the buffer, not bounce.
+					lastWord.Reset()
+					atomic.StoreInt32(&replacing, 0)
+					log.Printf("convert_last_word: revert %q → %q", convPrev, origPrev)
+				}()
+				return true
+			}
+
+			// Fresh-convert path.
+			if current == "" {
+				log.Printf("convert_last_word: empty buffer, no-op")
+				return true
+			}
+
+			// Direction heuristic mirrors convertSelectedText: any Cyrillic
+			// → assume RU was typed in QWERTY layout, convert RU→QWERTY;
+			// otherwise QWERTY→RU.
+			hasCyrillic := false
+			for _, r := range current {
+				if (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я') || r == 'ё' || r == 'Ё' {
+					hasCyrillic = true
+					break
+				}
+			}
+			var converted string
+			if hasCyrillic {
+				converted = RussianToQWERTY(current)
+			} else {
+				converted = QWERTYToRussian(current)
+			}
+
+			go func() {
+				atomic.StoreInt32(&replacing, 1)
+				buf.Clear()
+				for range current {
+					sendBackspaceKey()
+					time.Sleep(5 * time.Millisecond)
+				}
+				time.Sleep(10 * time.Millisecond)
+				for _, ch := range converted {
+					sendChar(ch)
+					time.Sleep(5 * time.Millisecond)
+				}
+				switchLang()
+				time.Sleep(30 * time.Millisecond)
+				// Arm the toggle window. The next convert_last_word press
+				// (with no real keystroke in between) will revert this.
+				lastWord.Set(current, converted)
+				atomic.StoreInt32(&replacing, 0)
+				log.Printf("convert_last_word: %q → %q", current, converted)
+			}()
+			return true
+		}
+
+		if !cfg.Enabled || !isAutoConvertEnabled() {
 			return false
 		}
 
-		// Cmd+Shift+X — manually convert selected text (killer feature)
-		if keycode == macX &&
-			(flags&kCGEventFlagMaskCommand) != 0 &&
-			(flags&kCGEventFlagMaskShift) != 0 {
-			log.Printf("Manual convert hotkey (Cmd+Shift+X)")
+		// Configurable selection-conversion hotkey (default Cmd+Shift+X).
+		// Exact-match-of-required-bits check (not full equality) because
+		// macOS sets device-dependent extra bits in the flags word.
+		if keycode == selectionHotkey.KeyCode &&
+			(flags&selectionHotkey.Modifiers) == selectionHotkey.Modifiers {
+			log.Printf("Manual convert hotkey (%s)", cfg.Hotkeys.ConvertSelection)
 			go convertSelectedText(detector)
 			return true // suppress the hotkey
 		}
@@ -363,6 +495,9 @@ func main() {
 
 		// Backspace
 		if keycode == macBackspace {
+			// Editing invalidates the convert_last_word toggle window:
+			// the buffer no longer matches what we last converted.
+			lastWord.Reset()
 			buf.Backspace()
 			if tracker != nil {
 				tracker.ObserveKey(KeyObservation{Kind: KeyKindBackspace})
@@ -439,7 +574,11 @@ func main() {
 			return true
 		}
 
-		// Regular char
+		// Regular char — any real keystroke invalidates the
+		// convert_last_word toggle window. The earlier guard skips
+		// modifier-only events (char == 0) before reaching here, so this
+		// only fires for actual typed characters.
+		lastWord.Reset()
 		buf.Add(char)
 		if tracker != nil {
 			res := tracker.ObserveKey(KeyObservation{Kind: KeyKindChar, Rune: char})
@@ -456,6 +595,10 @@ func main() {
 		log.Fatalf("Hook error: %v", err)
 	}
 	log.Println("Keyboard hook started")
+
+	// Sync the in-memory auto-convert flag with the persisted config value
+	// before the tray (and thus the menu checkmark) is created.
+	setAutoConvertEnabled(cfg.AutoConvert)
 
 	// Start tray icon
 	startTray()
