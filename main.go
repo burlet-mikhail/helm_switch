@@ -130,29 +130,16 @@ func looksLikeContext(word string) bool {
 	return false
 }
 
-// convertSelectedText: copy selected text, convert QWERTY↔Cyrillic, paste back.
-// Triggered by Cmd+Shift+X. Runs in a goroutine because it involves keystroke
-// synthesis and clipboard I/O that should not block the event tap callback.
-func convertSelectedText(detector *Detector) {
-	// Save current clipboard so we can restore it afterwards.
-	savedClipboard := readClipboard()
-
-	// Copy selection into clipboard and wait for the OS to populate it.
-	atomic.StoreInt32(&replacing, 1)
-	sendCopy()
-	time.Sleep(100 * time.Millisecond)
-
-	selected := readClipboard()
-	if selected == "" || selected == savedClipboard {
-		// Nothing selected, or copy didn't update the clipboard.
-		atomic.StoreInt32(&replacing, 0)
-		if savedClipboard != "" {
-			writeClipboard(savedClipboard)
-		}
-		log.Printf("Manual convert: no selection detected")
-		return
-	}
-
+// finishSelectionConvert: convert an already-copied selection and paste it
+// back. Caller is responsible for: saving the original clipboard, raising the
+// `replacing` flag, sending Cmd+C, and reading `selected` from the clipboard.
+// This function takes over from "we know what's selected" and runs the
+// convert + paste + restore-clipboard + switchLang + clear-replacing tail.
+//
+// Splitting the flow this way lets handleCapsLock reuse the single Cmd+C it
+// already sends to detect "selection vs. no selection" instead of double-
+// copying.
+func finishSelectionConvert(detector *Detector, savedClipboard, selected string) {
 	// Convert the entire selection in whichever direction fits.
 	// Heuristic: if it contains Cyrillic letters, convert RU→QWERTY; else QWERTY→RU.
 	var converted string
@@ -186,6 +173,135 @@ func convertSelectedText(detector *Detector) {
 	atomic.StoreInt32(&replacing, 0)
 
 	log.Printf("Manual convert: %q → %q", selected, converted)
+}
+
+// convertLastWordFromBuffer reads the last typed word from buf (which may be
+// either the in-progress word or the last flushed word if a space/boundary
+// was already typed) and replaces it with the layout-converted version. Arms
+// the toggle-back window so a subsequent Caps Lock press without intervening
+// real keystrokes reverts the conversion.
+//
+// Called from handleCapsLock when no selection was detected.
+func convertLastWordFromBuffer(buf *Buffer) {
+	origPrev, convPrev, active := lastWord.Snapshot()
+	current := buf.LastWord()
+
+	if active {
+		// Toggle-back path: revert convPrev → origPrev.
+		go func() {
+			atomic.StoreInt32(&replacing, 1)
+			buf.Clear()
+			for range convPrev {
+				sendBackspaceKey()
+				time.Sleep(5 * time.Millisecond)
+			}
+			time.Sleep(10 * time.Millisecond)
+			for _, ch := range origPrev {
+				sendChar(ch)
+				time.Sleep(5 * time.Millisecond)
+			}
+			switchLang()
+			time.Sleep(30 * time.Millisecond)
+			// Toggling back ends the toggle window — a subsequent press must
+			// re-convert from the buffer, not bounce.
+			lastWord.Reset()
+			atomic.StoreInt32(&replacing, 0)
+			log.Printf("convert_last_word: revert %q → %q", convPrev, origPrev)
+		}()
+		return
+	}
+
+	// Fresh-convert path.
+	if current == "" {
+		log.Printf("convert_last_word: empty buffer, no-op")
+		return
+	}
+
+	// If the current buffer is empty, LastWord() returned the last flushed
+	// word — meaning a space/boundary was already typed after it. We need to
+	// delete that trailing space too.
+	isFlushed := buf.IsBufferEmpty()
+
+	// Direction heuristic mirrors finishSelectionConvert: any Cyrillic → assume
+	// RU was typed in QWERTY layout, convert RU→QWERTY; otherwise QWERTY→RU.
+	hasCyrillic := false
+	for _, r := range current {
+		if (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я') || r == 'ё' || r == 'Ё' {
+			hasCyrillic = true
+			break
+		}
+	}
+	var converted string
+	if hasCyrillic {
+		converted = RussianToQWERTY(current)
+	} else {
+		converted = QWERTYToRussian(current)
+	}
+
+	go func() {
+		atomic.StoreInt32(&replacing, 1)
+		buf.Clear()
+
+		deleteCount := len([]rune(current))
+		if isFlushed {
+			deleteCount++ // delete the trailing space too
+		}
+		for i := 0; i < deleteCount; i++ {
+			sendBackspaceKey()
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(10 * time.Millisecond)
+		for _, ch := range converted {
+			sendChar(ch)
+			time.Sleep(5 * time.Millisecond)
+		}
+		if isFlushed {
+			// Re-type the space we deleted
+			sendChar(' ')
+			time.Sleep(5 * time.Millisecond)
+		}
+		switchLang()
+		time.Sleep(30 * time.Millisecond)
+		// Arm the toggle window. The next Caps Lock press (with no real
+		// keystroke in between) will revert this.
+		lastWord.Set(current, converted)
+		atomic.StoreInt32(&replacing, 0)
+		log.Printf("convert_last_word: %q → %q (flushed=%v)", current, converted, isFlushed)
+	}()
+}
+
+// handleCapsLock is the single Caps Lock entry point: detects whether the
+// user has a selection (by save → Cmd+C → diff clipboard) and dispatches to
+// the selection-conversion path or the last-word path accordingly.
+//
+// Runs in its own goroutine (spawned from onKeyEvent) because it involves
+// keystroke synthesis and clipboard I/O that must not block the event tap.
+func handleCapsLock(buf *Buffer, detector *Detector) {
+	savedClipboard := readClipboard()
+
+	// Raise the replacing flag BEFORE sending Cmd+C so our own copy doesn't
+	// re-enter the hook handler.
+	atomic.StoreInt32(&replacing, 1)
+	sendCopy()
+	time.Sleep(100 * time.Millisecond)
+
+	selected := readClipboard()
+
+	if selected != "" && selected != savedClipboard {
+		// Selection path — finishSelectionConvert keeps the replacing flag
+		// raised through paste/restore and clears it at the end.
+		finishSelectionConvert(detector, savedClipboard, selected)
+		return
+	}
+
+	// No selection: restore the clipboard, drop the replacing flag, then run
+	// the last-word path. (convertLastWordFromBuffer raises the flag again
+	// inside its own goroutine for the actual backspace+type sequence.)
+	atomic.StoreInt32(&replacing, 0)
+	if savedClipboard != "" {
+		writeClipboard(savedClipboard)
+	}
+	convertLastWordFromBuffer(buf)
 }
 
 func main() {
@@ -255,13 +371,6 @@ func main() {
 		log.Println("Disabled in config, exiting")
 		return
 	}
-
-	// Parse hotkeys once at startup. Invalid specs fall back to defaults
-	// (Cmd+Shift+X / Cmd+Shift+Z) with a logged warning — handled inside
-	// ParsedHotkeys.
-	selectionHotkey, lastWordHotkey := cfg.ParsedHotkeys()
-	log.Printf("Hotkeys: convert_selection=%s convert_last_word=%s",
-		cfg.Hotkeys.ConvertSelection, cfg.Hotkeys.ConvertLastWord)
 
 	// Exceptions store + rollback tracker — learning from user corrections.
 	// Store failures are non-fatal: we fall back to no-learning mode.
@@ -347,129 +456,33 @@ func main() {
 		}
 	})
 
-	// Modifier mask covering all four "real" modifiers — used by the
-	// convert_last_word handler to ensure no extra modifier (besides those
-	// required by the configured hotkey) is held. Without this, e.g. plain
-	// Cmd+Z (no Shift) would be misclassified when the configured hotkey
-	// is Cmd+Shift+Z.
-	const allModsMask = hotkeyFlagCommand | hotkeyFlagShift | hotkeyFlagControl | hotkeyFlagAlt
-
-	// Set up key event handler — called synchronously from CGEventTap
-	onKeyEvent = func(keycode uint16, char rune, flags int64) bool {
-		// Debug: log any key event with Command modifier
-		if (flags & hotkeyFlagCommand) != 0 {
-			log.Printf("DEBUG keyevent: keycode=0x%02X char=%d flags=0x%X | want_lw: kc=0x%02X mod=0x%X | want_sel: kc=0x%02X mod=0x%X",
-				keycode, char, flags,
-				lastWordHotkey.KeyCode, lastWordHotkey.Modifiers,
-				selectionHotkey.KeyCode, selectionHotkey.Modifiers)
-		}
-
-		// convert_last_word hotkey is checked BEFORE the cfg.Enabled /
-		// auto-convert gate (so it still works when auto-convert is off)
-		// AND before the Cmd+Z undo branch (so Cmd+Shift+Z is consumed
-		// here and never reaches undo).
-		if keycode == lastWordHotkey.KeyCode &&
-			(flags&lastWordHotkey.Modifiers) == lastWordHotkey.Modifiers &&
-			(flags & ^lastWordHotkey.Modifiers & allModsMask) == 0 {
-
-			origPrev, convPrev, active := lastWord.Snapshot()
-			current := buf.LastWord()
-
-			if active {
-				// Toggle-back path: revert convPrev → origPrev.
-				go func() {
-					atomic.StoreInt32(&replacing, 1)
-					buf.Clear()
-					for range convPrev {
-						sendBackspaceKey()
-						time.Sleep(5 * time.Millisecond)
-					}
-					time.Sleep(10 * time.Millisecond)
-					for _, ch := range origPrev {
-						sendChar(ch)
-						time.Sleep(5 * time.Millisecond)
-					}
-					switchLang()
-					time.Sleep(30 * time.Millisecond)
-					// Toggling back ends the toggle window — a subsequent
-					// press must re-convert from the buffer, not bounce.
-					lastWord.Reset()
-					atomic.StoreInt32(&replacing, 0)
-					log.Printf("convert_last_word: revert %q → %q", convPrev, origPrev)
-				}()
-				return true
+	// Set up key event handler — called synchronously from CGEventTap.
+	// eventType is the CGEventType: kCGEventTypeKeyDown for normal keystrokes
+	// and kCGEventTypeFlagsChanged for modifier transitions (including Caps
+	// Lock, which on macOS arrives as a flags-changed event with no Unicode
+	// payload).
+	onKeyEvent = func(eventType int64, keycode uint16, char rune, flags int64) bool {
+		// Caps Lock is the single hardcoded conversion hotkey. It arrives as
+		// kCGEventFlagsChanged with keycode 0x39, and macOS emits exactly one
+		// such event per physical press (no auto-repeat), so this naturally
+		// fires once per press. The branch is checked BEFORE the cfg.Enabled
+		// / auto-convert gate so the manual hotkey works even when auto-
+		// convert is off and even in excluded apps.
+		if eventType == kCGEventTypeFlagsChanged {
+			if keycode == capsLockKeyCode &&
+				(flags & ^capsLockMask & anyModifierMask) == 0 {
+				// Plain Caps Lock — no other real modifier (Shift/Ctrl/Alt/Cmd)
+				// is held. We mask out the Caps Lock bit itself before checking
+				// for "any modifier" because the AlphaShift bit toggles on
+				// every press regardless of whether the LED is lighting up or
+				// switching off.
+				go handleCapsLock(buf, detector)
+				return true // suppress so the OS doesn't toggle the layout/case state
 			}
-
-			// Fresh-convert path.
-			if current == "" {
-				log.Printf("convert_last_word: empty buffer, no-op")
-				return true
-			}
-
-			// If the current buffer is empty, LastWord() returned the
-			// last flushed word — meaning a space/boundary was already
-			// typed after it. We need to delete that trailing space too.
-			isFlushed := buf.IsBufferEmpty()
-
-			// Direction heuristic mirrors convertSelectedText: any Cyrillic
-			// → assume RU was typed in QWERTY layout, convert RU→QWERTY;
-			// otherwise QWERTY→RU.
-			hasCyrillic := false
-			for _, r := range current {
-				if (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я') || r == 'ё' || r == 'Ё' {
-					hasCyrillic = true
-					break
-				}
-			}
-			var converted string
-			if hasCyrillic {
-				converted = RussianToQWERTY(current)
-			} else {
-				converted = QWERTYToRussian(current)
-			}
-
-			go func() {
-				atomic.StoreInt32(&replacing, 1)
-				buf.Clear()
-
-				deleteCount := len([]rune(current))
-				if isFlushed {
-					deleteCount++ // delete the trailing space too
-				}
-				for i := 0; i < deleteCount; i++ {
-					sendBackspaceKey()
-					time.Sleep(5 * time.Millisecond)
-				}
-				time.Sleep(10 * time.Millisecond)
-				for _, ch := range converted {
-					sendChar(ch)
-					time.Sleep(5 * time.Millisecond)
-				}
-				if isFlushed {
-					// Re-type the space we deleted
-					sendChar(' ')
-					time.Sleep(5 * time.Millisecond)
-				}
-				switchLang()
-				time.Sleep(30 * time.Millisecond)
-				// Arm the toggle window. The next convert_last_word press
-				// (with no real keystroke in between) will revert this.
-				lastWord.Set(current, converted)
-				atomic.StoreInt32(&replacing, 0)
-				log.Printf("convert_last_word: %q → %q (flushed=%v)", current, converted, isFlushed)
-			}()
-			return true
-		}
-
-		// Configurable selection-conversion hotkey (default Cmd+Shift+X).
-		// Checked BEFORE the auto-convert gate so it works even when
-		// auto-convert is off.
-		if keycode == selectionHotkey.KeyCode &&
-			(flags&selectionHotkey.Modifiers) == selectionHotkey.Modifiers &&
-			(flags & ^selectionHotkey.Modifiers & allModsMask) == 0 {
-			log.Printf("Manual convert hotkey (%s)", cfg.Hotkeys.ConvertSelection)
-			go convertSelectedText(detector)
-			return true // suppress the hotkey
+			// Any other flags-changed event (Shift/Cmd/Option pressed alone,
+			// or Caps Lock combined with another modifier we want to leave
+			// alone) — pass through.
+			return false
 		}
 
 		if !cfg.Enabled || !isAutoConvertEnabled() {

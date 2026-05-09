@@ -10,8 +10,11 @@ package main
 #include <Carbon/Carbon.h>
 #include <ApplicationServices/ApplicationServices.h>
 
-// goKeyCallback returns 1 to suppress the event, 0 to pass through
-extern int goKeyCallback(int64_t keycode, UniChar character, int64_t flags);
+// goKeyCallback returns 1 to suppress the event, 0 to pass through.
+// eventType is the CGEventType (10 = key down, 12 = flags changed) so the Go
+// side can branch — Caps Lock arrives as kCGEventFlagsChanged with no
+// character data.
+extern int goKeyCallback(int64_t eventType, int64_t keycode, UniChar character, int64_t flags);
 
 static CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
@@ -19,17 +22,21 @@ static CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEvent
         return event;
     }
 
-    if (type != kCGEventKeyDown) return event;
+    if (type != kCGEventKeyDown && type != kCGEventFlagsChanged) return event;
 
     CGKeyCode keycode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
     CGEventFlags flags = CGEventGetFlags(event);
 
-    UniChar chars[4];
-    UniCharCount len = 0;
-    CGEventKeyboardGetUnicodeString(event, 4, &len, chars);
-    UniChar ch = (len > 0) ? chars[0] : 0;
+    UniChar ch = 0;
+    if (type == kCGEventKeyDown) {
+        UniChar chars[4];
+        UniCharCount len = 0;
+        CGEventKeyboardGetUnicodeString(event, 4, &len, chars);
+        if (len > 0) ch = chars[0];
+    }
+    // For kCGEventFlagsChanged there is no Unicode payload — keep ch = 0.
 
-    int suppress = goKeyCallback((int64_t)keycode, ch, (int64_t)flags);
+    int suppress = goKeyCallback((int64_t)type, (int64_t)keycode, ch, (int64_t)flags);
     if (suppress) return NULL;
     return event;
 }
@@ -44,7 +51,7 @@ static void promptAccessibility(void) {
 }
 
 static CFMachPortRef createTap(void) {
-    CGEventMask mask = (1 << kCGEventKeyDown);
+    CGEventMask mask = (1 << kCGEventKeyDown) | (1 << kCGEventFlagsChanged);
     CFMachPortRef tap = CGEventTapCreate(
         kCGSessionEventTap,
         kCGHeadInsertEventTap,
@@ -67,21 +74,34 @@ import (
 )
 
 const (
-	kCGEventFlagMaskCommand = 1 << 20
+	kCGEventFlagMaskCommand        = 1 << 20
+	kCGEventTypeKeyDown      int64 = 10
+	kCGEventTypeFlagsChanged int64 = 12
+	capsLockKeyCode          uint16 = 0x39
+	// NX_ALPHASHIFTMASK / kCGEventFlagMaskAlphaShift — set when Caps Lock is "on".
+	capsLockMask int64 = 1 << 16
+	// Combined real-modifier bits (shift|control|alt|command). Used to reject
+	// e.g. Cmd+CapsLock so OS-level CapsLock+modifier shortcuts still pass.
+	anyModifierMask int64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)
 )
 
 // onKeyEvent is set by main() — called synchronously from CGEventTap callback.
-// Returns true to suppress the event.
-var onKeyEvent func(keycode uint16, char rune, flags int64) bool
+// Returns true to suppress the event. eventType is the CGEventType (10 for
+// key down, 12 for flags changed); flagschanged events carry no character
+// payload (char == 0).
+var onKeyEvent func(eventType int64, keycode uint16, char rune, flags int64) bool
 
 //export goKeyCallback
-func goKeyCallback(keycode C.int64_t, character C.UniChar, flags C.int64_t) C.int {
+func goKeyCallback(eventType C.int64_t, keycode C.int64_t, character C.UniChar, flags C.int64_t) C.int {
+	// Bail out early during our own paste/type sequences so Caps Lock (and any
+	// other event) issued by the OS in response to our synthesised input does
+	// not re-enter the handler.
 	if atomic.LoadInt32(&replacing) == 1 {
 		return 0
 	}
 
 	if onKeyEvent != nil {
-		if onKeyEvent(uint16(keycode), rune(character), int64(flags)) {
+		if onKeyEvent(int64(eventType), uint16(keycode), rune(character), int64(flags)) {
 			return 1 // suppress
 		}
 	}

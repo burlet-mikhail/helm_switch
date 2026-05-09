@@ -1,234 +1,227 @@
-<!-- handoff:task:e3e7eb4a-e7e1-4c9b-ac3f-0101ed7e6f1f -->
-# RuSwitch: Dynamic Tray Flags + Configurable Hotkeys + Last Word Conversion
+<!-- handoff:task:ff20b79e-a1a1-49d6-8172-38383f25f3fa -->
+# Plan: Caps Lock as Hardcoded Conversion Hotkey
 
-Branch: main
-Mode: fast
-Created: 2026-04-25
+**Mode:** fast  
+**Tests:** false (no new test scaffolding)  
+**Docs:** false  
+**Platform scope:** darwin (macOS). Windows hook only needs a signature-compat shim.
 
-## Settings
+---
 
-- [x] Testing: no (do not add test-writing tasks)
-- [x] Logging: verbose (use `log.Printf` for events; `vlog` for fine-grained traces consistent with `buffer.go`/`replacer_darwin.go`)
-- [x] Docs: no (no doc tasks)
+## 1. Goal
 
-## Scope Summary
+Replace the two configurable hotkeys (`convert_selection`, `convert_last_word`) with a single hardcoded **Caps Lock** key. Behavior is context-aware:
 
-Implement three macOS-only features in the existing Go + Objective-C tray app:
+- [x] Selection present → convert selected text (current `convertSelectedText` flow).
+- [x] No selection → convert last typed word (current `convert_last_word` inline flow in `main.go`).
 
-1. Dynamic tray icon: 🇷🇺 when current keyboard input source is Russian, 🇺🇸 otherwise. Updates instantly via `NSDistributedNotificationCenter` observer for `NSTextInputContextKeyboardSelectionDidChangeNotification`.
-2. Configurable hotkey to convert the last typed word (default `Cmd+Shift+Z`) using current `Buffer` contents; toggles back if pressed again with no buffer change.
-3. Hotkeys are configurable via `~/Library/Application Support/RuSwitch/config.yaml` (`hotkeys.convert_selection`, `hotkeys.convert_last_word`).
-4. Remove pause/resume concept; replace tray with "Автоконвертация" toggle backed by a new `autoConvertEnabled` atomic var.
+Caps Lock arrives as `kCGEventFlagsChanged` (type 12), keycode `0x39`. The current event tap in `hook_darwin.go` only listens to `kCGEventKeyDown` and must be widened. The CGO callback signature must gain an `eventType` parameter so Go-side code can branch on it.
 
-Files to modify: `config.go`, `buffer.go`, `main.go`, `tray_darwin.go`, `tray_darwin.m`.
-Files NOT modified: `detector.go`, `dict.go`, `keymap.go`, `hook_darwin.go`, `replacer_darwin.go`, `exceptions.go`, `rollback.go`, `appid_darwin.go`, `logging.go`, `types.go`.
+All hotkey config plumbing (`HotkeyConfig`, `ParseHotkey`, `ParsedHotkeys`, `modifierMap`, `keyMap`, default hotkey constants, `Config.Hotkeys`, `hotkeyFlag*` modifier constants) is deleted.
 
-Existing call sites that need attention:
-- [x] `main.go:252` — buffer callback uses `isTrayEnabled()` (replaced with `isAutoConvertEnabled()`)
-- [x] `main.go:302` — `onKeyEvent` early return uses `isTrayEnabled()` (replaced with `isAutoConvertEnabled()`)
-- [x] `main.go:307-313` — hardcoded `Cmd+Shift+X` (`macX` + Cmd + Shift) for `convertSelectedText` (replaced with parsed `selectionHotkey`)
-- [x] `main.go:21-31` — local consts `macX`, `macZ`, `kCGEventFlagMaskShift` (`macX` and `kCGEventFlagMaskShift` removed; `macZ` retained for the Cmd+Z undo branch; `macC`/`macV` also removed as unused)
-- [x] `tray_darwin.go:23-56` — `trayEnabled`, `goTrayToggle`, `isTrayEnabled` (replaced with `autoConvertEnabled`/`goAutoConvertToggle`/`isAutoConvertEnabled`)
-- [x] `tray_darwin.m:25-65` — `createTray`, `updateTray`, plus the duplicate menu setup inside `ensureApp` (collapsed into single `ensureApp` definition; old `createTray`/`updateTray` removed; new `updateAutoConvertMenu` added)
+---
 
-## Tasks
+## 2. Files touched
 
-### Phase 1 — Config: parsed hotkeys + auto-convert flag
+| File | Change |
+|---|---|
+| `hook_darwin.go` | Extend event mask; handle `kCGEventFlagsChanged`; widen `goKeyCallback` and `onKeyEvent` signatures; add Caps Lock constants. |
+| `hook_windows.go` | Mirror the new `onKeyEvent` signature so the package compiles on Windows. (Caps Lock not implemented there.) |
+| `main.go` | Add `eventType` param to `onKeyEvent`; add Caps Lock branch; extract last-word logic into a function; add `handleCapsLock`; remove old hotkey checks, `ParsedHotkeys` call, debug log, and `allModsMask`. |
+| `config.go` | Delete `HotkeyConfig`, `Config.Hotkeys`, `ParseHotkey`, `ParsedHotkeys`, `modifierMap`, `keyMap`, `hotkeyFlag*` constants, default hotkey constants, `LoadConfig` backfill. |
+| `replacer_darwin.go` | No code change (reuses `sendCopy`, `sendPaste`, `readClipboard`, `writeClipboard`, `replacing` flag). |
+| `buffer.go`, `detector.go`, `dict.go`, `keymap.go`, `exceptions.go`, `rollback.go`, `tray_darwin.go`, `appid_darwin.go` | Untouched. |
+| `README.md` | No changes required (no hotkey references found). |
 
-<!-- parallel: none (Tasks 1-4 modify same file sequentially) -->
-- [x] **1. Extend `Config` in `config.go` with `HotkeyConfig` raw strings + `AutoConvert`.**
-  - [ ] Add struct `HotkeyConfig` with fields `ConvertSelection string \`yaml:"convert_selection"\`` and `ConvertLastWord string \`yaml:"convert_last_word"\``.
-  - [ ] Add field `Hotkeys HotkeyConfig \`yaml:"hotkeys"\`` to `Config`.
-  - [ ] Add field `AutoConvert bool \`yaml:"auto_convert"\`` to `Config` (default `true` so existing users keep current behavior).
-  - [ ] In `DefaultConfig()` set `AutoConvert: true` and `Hotkeys: HotkeyConfig{ConvertSelection: "Cmd+Shift+X", ConvertLastWord: "Cmd+Shift+Z"}`.
-  - [ ] After `yaml.Unmarshal` in `LoadConfig`, fill empty `Hotkeys.ConvertSelection` / `Hotkeys.ConvertLastWord` with defaults (so old config files without the `hotkeys` block still get them).
-  - [ ] Log via `log.Printf` when defaults are applied.
+User config at `~/Library/Application Support/RuSwitch/config.yaml` keeps any pre-existing `hotkeys:` section as a silently-ignored unknown field (`yaml.Unmarshal` is non-strict). On first save (`SaveConfig`) the file is rewritten without the `hotkeys` block.
 
-- [x] **2. Add parsed `Hotkey` type and `ParseHotkey` to `config.go`.**
-  - [ ] Define `type Hotkey struct { KeyCode uint16; Modifiers int64 }`.
-  - [ ] Define a private modifier map (string → CGEventFlags bitmask): `Cmd`/`Command`/`Cmd` → `1<<20`, `Shift` → `1<<17`, `Ctrl`/`Control` → `1<<18`, `Alt`/`Option`/`Opt` → `1<<19`. Match case-insensitively.
-  - [ ] Define a private key map covering A–Z (macOS virtual keycodes: A=0x00, B=0x0B, C=0x08, D=0x02, E=0x0E, F=0x03, G=0x05, H=0x04, I=0x22, J=0x26, K=0x28, L=0x25, M=0x2E, N=0x2D, O=0x1F, P=0x23, Q=0x0C, R=0x0F, S=0x01, T=0x11, U=0x20, V=0x09, W=0x0D, X=0x07, Y=0x10, Z=0x06) plus 0–9 and basic specials (`Space`=0x31, `Return`/`Enter`=0x24).
-  - [ ] `func ParseHotkey(spec string) (Hotkey, error)`:
-    - [ ] Trim spaces, split on `+`.
-    - [ ] Last token = key (case-insensitive lookup in key map).
-    - [ ] Preceding tokens = modifiers OR’d into `Modifiers`.
-    - [ ] Return `(Hotkey{}, error)` if any token is unknown or the spec is empty.
+---
 
-- [x] **3. Add helper `ParsedHotkeys()` on `*Config` that returns parsed hotkeys with defaults on error.**
-  - [ ] `func (c *Config) ParsedHotkeys() (selection, lastWord Hotkey)`:
-    - [ ] Try `ParseHotkey(c.Hotkeys.ConvertSelection)`. On error: `log.Printf("hotkey parse warning: convert_selection=%q invalid (%v); using default Cmd+Shift+X", spec, err)` and fall back to a hard-coded `Hotkey{KeyCode: 0x07, Modifiers: (1<<20)|(1<<17)}`.
-    - [ ] Same pattern for `convert_last_word`, default `Hotkey{KeyCode: 0x06, Modifiers: (1<<20)|(1<<17)}`.
+## 3. Implementation checklist
 
-- [x] **4. Confirm config persistence still round-trips.**
-  - [x] Verify `SaveConfig` already serializes new fields (yaml.Marshal handles them via struct tags — no code change needed beyond the struct edits in Task 1).
+<!-- parallel: none — sections 3.1–3.5 share function signatures and are executed sequentially in a single layer -->
 
-### Phase 2 — Buffer: expose last word
+### 3.1 `hook_darwin.go` — widen event tap and callback
 
-- [x] **5. Add `Buffer.LastWord() string` to `buffer.go`.**
-  - [x] Method returns `string(b.chars)` under `b.mu` without mutating `b.chars`.
-  - [x] Returns `""` when `len(b.chars) == 0`.
-  - [x] Do NOT call `b.onWord`. Do NOT clear.
+- [x] In the C `createTap`, widen the event mask:
+  ```c
+  CGEventMask mask = (1 << kCGEventKeyDown) | (1 << kCGEventFlagsChanged);
+  ```
+- [x] In `eventCallback`, replace the early-return on non-keydown. Accept both `kCGEventKeyDown` and `kCGEventFlagsChanged`; pass the type through to Go:
+  - [x] For `kCGEventFlagsChanged`, do **not** call `CGEventKeyboardGetUnicodeString` (no character data) — pass `ch = 0`. `CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)` and `CGEventGetFlags(event)` both work for flagschanged events, so the existing reads on lines 24–25 stay unchanged.
+  - [x] Keep the `kCGEventTapDisabledByTimeout / kCGEventTapDisabledByUserInput` branch as-is (re-enables the tap).
+  - [x] Any other type → `return event`.
+- [x] Update the C extern declaration and Go `//export goKeyCallback` to take a new `int64_t eventType` first parameter:
+  ```c
+  extern int goKeyCallback(int64_t eventType, int64_t keycode, UniChar character, int64_t flags);
+  ```
+- [x] Update the Go `goKeyCallback` body to forward `eventType` to `onKeyEvent`. Keep the `replacing == 1` short-circuit (returns 0) at the very top so Caps Lock is also bypassed during our own paste/type sequences.
+- [x] Change the Go `onKeyEvent` variable declaration to:
+  ```go
+  var onKeyEvent func(eventType int64, keycode uint16, char rune, flags int64) bool
+  ```
+- [x] Add Caps Lock constants in the Go side of `hook_darwin.go` (alongside `kCGEventFlagMaskCommand`):
+  ```go
+  const (
+      kCGEventFlagMaskCommand   = 1 << 20
+      kCGEventTypeKeyDown       int64 = 10
+      kCGEventTypeFlagsChanged  int64 = 12
+      capsLockKeyCode           uint16 = 0x39
+      capsLockMask              int64  = 1 << 16 // NX_ALPHASHIFTMASK
+      anyModifierMask           int64  = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) // shift|ctrl|alt|cmd
+  )
+  ```
+  (Drop `kCGEventFlagMaskCommand`'s old standalone block; merge.)
 
-### Phase 3 — main.go: parsed hotkeys + last-word handler
+### 3.2 `hook_windows.go` — keep package compiling
 
-- [x] **6. Wire parsed hotkeys into `main()` after `LoadConfig`.**
-  - [ ] After the existing `cfg, err := LoadConfig()` block (around `main.go:207`), call `selectionHotkey, lastWordHotkey := cfg.ParsedHotkeys()`.
-  - [ ] Log resolved hotkeys: `log.Printf("Hotkeys: convert_selection=%s convert_last_word=%s", cfg.Hotkeys.ConvertSelection, cfg.Hotkeys.ConvertLastWord)`.
+- [x] Update the `onKeyEvent` variable declaration (currently at line 58) to match the new signature (eventType ignored on Windows):
+  ```go
+  var onKeyEvent func(eventType int64, keycode uint16, char rune, flags int64) bool
+  ```
+- [x] In the keyboard-hook callback (line 78: `onKeyEvent(uint16(kb.VkCode), ch, 0)`), pass a constant `0` for `eventType` as the first argument. Document inline that flagschanged interception is not implemented on Windows. *(Used `kCGEventTypeKeyDown` constant rather than literal `0` for clarity; eventType branch in main.go is dead on Windows because we always pass key-down.)*
+- [x] Leave the `const kCGEventFlagMaskCommand = 0` shim (line 61) in place — `main.go`'s Cmd+Z branch still references it, and Windows treats it as a no-op match.
+- [x] **Added (not in plan):** Mirror Caps Lock constants (`kCGEventTypeFlagsChanged`, `capsLockKeyCode`, `capsLockMask`, `anyModifierMask`) on Windows so `main.go` (which has no build tag) compiles. The constants are dead code on Windows because the hook callback always passes `kCGEventTypeKeyDown`.
 
-- [x] **7. Add `lastWordConversion` state struct in `main.go`.**
-  - [ ] Define near the top of `main.go` (next to `undoState`):
-    ```go
-    type lastWordState struct {
-        mu        sync.Mutex
-        original  string // word as the user typed it (pre-conversion)
-        converted string // what we typed instead
-        active    bool  // true if the next hotkey press should toggle back
-    }
-    var lastWord lastWordState
-    ```
-  - [ ] Add helper methods `Set(original, converted string)`, `Reset()`, `Snapshot() (original, converted string, active bool)`. All methods must lock `mu`.
-  - [ ] Note on toggle invalidation: because the event tap is suppressed while `replacing == 1` (see `hook_darwin.go:79`), the synthetic backspaces and typed characters during conversion do NOT update `buf`. We therefore detect "buffer changed since conversion" by `Reset()`-ing `lastWord.active` from the regular-key and backspace paths in `onKeyEvent` (Task 10) — NOT by comparing `buf.LastWord()` to a snapshot.
+### 3.3 `main.go` — Caps Lock handler + cleanup
 
-- [x] **8. Replace hardcoded `Cmd+Shift+X` selection-hotkey check in `onKeyEvent`.**
-  - [ ] In `main.go:307-313`, replace the literal `keycode == macX && Cmd && Shift` test with:
-    ```go
-    if keycode == selectionHotkey.KeyCode && (flags & selectionHotkey.Modifiers) == selectionHotkey.Modifiers {
-        log.Printf("Manual convert hotkey (%s)", cfg.Hotkeys.ConvertSelection)
-        go convertSelectedText(detector)
-        return true
-    }
-    ```
-  - [ ] Keep the `selectionHotkey` capture inside the `onKeyEvent` closure.
-  - [ ] Note: the mask compare must use exact-match-of-required-bits (`flags & mods == mods`); do NOT require equality with the full flags word, because macOS sets device-dependent extra bits.
+- [x] Update `onKeyEvent` assignment to the new signature: `func(eventType int64, keycode uint16, char rune, flags int64) bool`.
+- [x] **Delete** these blocks/lines from `main()`:
+  - [x] The `selectionHotkey, lastWordHotkey := cfg.ParsedHotkeys()` call and the `log.Printf("Hotkeys: ...")` line that follows it.
+  - [x] The `const allModsMask = ...` declaration above `onKeyEvent`.
+  - [x] The DEBUG `log.Printf("DEBUG keyevent: ...", lastWordHotkey..., selectionHotkey...)` block at the top of `onKeyEvent`.
+  - [x] The whole `if keycode == lastWordHotkey.KeyCode && ...` block (the convert-last-word inline body).
+  - [x] The whole `if keycode == selectionHotkey.KeyCode && ...` block (the convert-selection hotkey body).
+- [x] **Extract** the convert-last-word logic into a top-level package function `convertLastWordFromBuffer(buf *Buffer)` that contains the body previously inlined in `onKeyEvent` (snapshot, toggle-back, fresh-convert, `lastWord.Set` arming, goroutine, etc.). Call sites: `handleCapsLock` (no-selection branch).
+- [x] **Add** a top-level package function `handleCapsLock(buf *Buffer, detector *Detector)`:
+  ```go
+  func handleCapsLock(buf *Buffer, detector *Detector) {
+      savedClipboard := readClipboard()
 
-- [x] **9. Implement `convert_last_word` handler in `onKeyEvent`.**
-  - [ ] Place the new branch BEFORE the `if !cfg.Enabled || !isAutoConvertEnabled()` early return at the top of `onKeyEvent`, so the hotkey works even when auto-convert is off.
-  - [ ] Place it BEFORE the existing `Cmd+Z` undo handler so a Cmd+Shift+Z press is consumed here and never reaches the undo branch.
-  - [ ] Match condition (using the parsed `lastWordHotkey` captured by the closure):
-    - [ ] `keycode == lastWordHotkey.KeyCode`
-    - [ ] `(flags & lastWordHotkey.Modifiers) == lastWordHotkey.Modifiers` (all required modifiers present)
-    - [ ] AND `(flags & ^lastWordHotkey.Modifiers & (kCGEventFlagMaskCommand|kCGEventFlagMaskShift|(1<<18)|(1<<19))) == 0` — no extra modifier from {Cmd, Shift, Ctrl, Alt}, so plain `Cmd+Z` (no Shift) still falls through to the undo branch.
-  - [ ] On match:
-    1. Snapshot state under `lastWord.mu`: `origPrev, convPrev, active := lastWord.Snapshot()`. Take `current := buf.LastWord()`.
-    2. **Toggle-back path** — if `active`:
-       - [ ] Run the replacement goroutine using `convPrev` as "what is on screen" and `origPrev` as "what to type":
-         - [ ] `atomic.StoreInt32(&replacing, 1)`
-         - [ ] `buf.Clear()`
-         - [ ] For each rune in `convPrev`: `sendBackspaceKey()`, sleep 5ms.
-         - [ ] sleep 10ms.
-         - [ ] For each rune in `origPrev`: `sendChar(ch)`, sleep 5ms.
-         - [ ] `switchLang()`, sleep 30ms.
-         - [ ] `lastWord.Reset()` — toggling-back ends the toggle window; a subsequent Cmd+Shift+Z must re-convert from the buffer.
-         - [ ] `atomic.StoreInt32(&replacing, 0)`
-         - [ ] `log.Printf("convert_last_word: revert %q → %q", convPrev, origPrev)`
-       - [ ] Return `true` (suppress).
-    3. **Fresh-convert path** — if `!active`:
-       - [ ] If `current == ""`: `log.Printf("convert_last_word: empty buffer, no-op")` and return `true`.
-       - [ ] Direction heuristic (mirror `convertSelectedText`):
-         ```go
-         hasCyrillic := false
-         for _, r := range current {
-             if (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я') || r == 'ё' || r == 'Ё' {
-                 hasCyrillic = true
-                 break
-             }
-         }
-         var converted string
-         if hasCyrillic {
-             converted = RussianToQWERTY(current)
-         } else {
-             converted = QWERTYToRussian(current)
-         }
-         ```
-       - [ ] Goroutine (mirrors the Cmd+Z undo goroutine pattern):
-         - [ ] `atomic.StoreInt32(&replacing, 1)`
-         - [ ] `buf.Clear()`
-         - [ ] For each rune in `current`: `sendBackspaceKey()`, sleep 5ms.
-         - [ ] sleep 10ms.
-         - [ ] For each rune in `converted`: `sendChar(ch)`, sleep 5ms.
-         - [ ] `switchLang()`, sleep 30ms.
-         - [ ] `lastWord.Set(current, converted)` (this also sets `active = true`).
-         - [ ] `atomic.StoreInt32(&replacing, 0)`
-         - [ ] `log.Printf("convert_last_word: %q → %q", current, converted)`
-       - [ ] Return `true` (suppress).
-  - [ ] Concurrency note: the synthetic keystrokes inside the goroutine are produced while `replacing == 1`, so `goKeyCallback` short-circuits (see `hook_darwin.go:79`) and `buf` does NOT receive them. This is exactly why we rely on Task 10's reset-on-real-keystroke to invalidate the toggle window, rather than comparing buffer snapshots.
+      atomic.StoreInt32(&replacing, 1)
+      sendCopy()
+      time.Sleep(100 * time.Millisecond)
 
-- [x] **10. Reset `lastWord.active` on any other real keystroke.**
-  - [ ] In `onKeyEvent`, on the regular-char path (around `main.go:443`, just before `buf.Add(char)`), call `lastWord.Reset()`.
-  - [ ] Also call `lastWord.Reset()` inside the `if keycode == macBackspace` branch so editing invalidates the toggle window.
-  - [ ] Do NOT reset inside the `convert_last_word` handler itself — the handler manages its own state via `Set`/`Reset`.
-  - [ ] Do NOT reset for modifier-only events: the existing guard `if char == 0 || char == 0x08 { return false }` will skip those before we reach the reset point on the char path; for backspace the reset is still correct because backspace is an explicit edit.
+      selected := readClipboard()
 
-### Phase 4 — Tray: replace pause with auto-convert toggle
+      if selected != "" && selected != savedClipboard {
+          // Selection path: mirror convertSelectedText body, but reuse the
+          // already-issued Cmd+C so we do not double-copy. Inline the
+          // convert + paste + restore-clipboard + switchLang + replacing=0.
+          // (See 3.4 — convertSelectedText is refactored to accept a
+          // pre-copied selection.)
+          finishSelectionConvert(detector, savedClipboard, selected)
+          return
+      }
 
-- [x] **11. Rewrite `tray_darwin.go` state to `autoConvertEnabled`.**
-  - [ ] Remove: `trayEnabled`, `isTrayEnabled()`, `goTrayToggle()`, the (unused) Go-side `createTray` declaration in the cgo header, and `updateTray`.
-  - [ ] Add: `var autoConvertEnabled int32 = 1` (initialized to `1`, will be synced to config in Task 12).
-  - [ ] Add: `//export goAutoConvertToggle` that flips the atomic var, calls a new C function `updateAutoConvertMenu(int)` to refresh the checkmark, and logs `"Auto-convert: enabled/disabled"`.
-  - [ ] Add: `func isAutoConvertEnabled() bool { return atomic.LoadInt32(&autoConvertEnabled) == 1 }`.
-  - [ ] Update the cgo header block to declare only the C symbols still in use: `void ensureApp(void); void runNSApp(void); void removeTray(void); void updateAutoConvertMenu(int);`.
-  - [ ] Keep `goTrayQuit` and `func startTray()` / `runAppLoop()` as-is.
+      // No selection: restore clipboard, drop the replacing flag, then
+      // run the last-word path.
+      atomic.StoreInt32(&replacing, 0)
+      if savedClipboard != "" {
+          writeClipboard(savedClipboard)
+      }
+      convertLastWordFromBuffer(buf)
+  }
+  ```
+- [x] **Add the Caps Lock branch** at the very top of `onKeyEvent` (before the `cfg.Enabled` / `auto-convert` gate, before Cmd+Z, mirroring the previous "checked before gate" hotkey behavior):
+  ```go
+  if eventType == kCGEventTypeFlagsChanged {
+      if keycode == capsLockKeyCode &&
+          (flags & ^capsLockMask & anyModifierMask) == 0 {
+          // Plain Caps Lock — no other modifier held.
+          go handleCapsLock(buf, detector)
+          return true // suppress the toggle so the OS layout/case state is not flipped
+      }
+      // Any other flagschanged event (Shift, Cmd, Option, etc.) — ignore.
+      return false
+  }
+  ```
+  Notes:
+  - [x] Closure already captures `buf` and `detector` (defined earlier in `main()`).
+  - [x] We fire on every flagschanged with keycode `0x39` regardless of whether the AlphaShift bit is currently set or cleared — kCGEventFlagsChanged emits exactly one event per physical Caps Lock press, so this gives one conversion per press.
+  - [x] The combined-modifier guard `(flags & ^capsLockMask & anyModifierMask) == 0` rejects e.g. Cmd+CapsLock so the user can still reach OS-level CapsLock+modifier shortcuts.
+- [x] After the Caps Lock branch, leave the rest of `onKeyEvent` (Cmd+Z, backspace, regular char ingestion, Enter-flush) **unchanged**, except for the new function signature.
+- [x] Confirm `lastWord.Reset()` is **not** called from the Caps Lock branch (the existing reset on backspace and on regular char in the keydown branch still invalidates the toggle window correctly).
 
-- [x] **12. Initialize `autoConvertEnabled` from `cfg.AutoConvert` at startup.**
-  - [ ] In `main.go`, right after reading config and before `startTray()`, call a new helper `setAutoConvertEnabled(cfg.AutoConvert)` defined in `tray_darwin.go` that sets the atomic var and calls `C.updateAutoConvertMenu(...)` (safe even before menu exists — guarded inside the C function).
+### 3.4 `main.go` — refactor `convertSelectedText`
 
-- [x] **13. Replace remaining `isTrayEnabled()` callsites in `main.go`.**
-  - [ ] `main.go:252` (buffer onWord callback): replace `!isTrayEnabled()` with `!isAutoConvertEnabled()`.
-  - [ ] `main.go:302` (onKeyEvent early return): replace `!isTrayEnabled()` with `!isAutoConvertEnabled()`.
-  - [ ] Confirm no other references via Grep before finishing this task.
+The existing `convertSelectedText(detector *Detector)` performs save-clipboard → Cmd+C → wait → read → convert → paste → restore. `handleCapsLock` already does the save+copy+wait+read steps, so split out the post-copy half:
 
-### Phase 5 — Tray Objective-C: dynamic flags + auto-convert menu
+- [x] Add a new function `finishSelectionConvert(detector *Detector, savedClipboard, selected string)` containing the body from `convertSelectedText` starting at "Convert the entire selection in whichever direction fits..." (heuristic, `writeClipboard(converted)`, `sendPaste()`, `writeClipboard(savedClipboard)`, `switchLang()`, `replacing = 0`, log).
+- [x] Either delete `convertSelectedText` entirely (it had only one caller — the now-removed `selectionHotkey` block) or keep it as a thin wrapper that does the copy then calls `finishSelectionConvert`. **Delete it** — no other callers remain.
 
-- [x] **14. Replace tray menu in `tray_darwin.m` `ensureApp` with auto-convert toggle.**
-  - [ ] Remove the `⏸ Приостановить` menu item.
-  - [ ] Add `NSMenuItem *autoConvertItem = [[NSMenuItem alloc] initWithTitle:@"Автоконвертация" action:@selector(autoConvertAction:) keyEquivalent:@""];` with `target = delegate`.
-  - [ ] Set initial `state` based on a new C-level mirror variable `static int autoConvertOn = 1;` (set via `updateAutoConvertMenu`).
-  - [ ] Keep separator and `Выйти` item (selector `quitAction:` → `goTrayQuit()`).
-  - [ ] Expose `extern void goAutoConvertToggle(void);` and remove `extern void goTrayToggle(void);`.
-  - [ ] Add new selector method on `TrayDelegate`: `- (void)autoConvertAction:(id)sender { goAutoConvertToggle(); }`.
-  - [ ] Remove the now-unused `createTray` function and its `extern` exposure (the build still works because `tray_darwin.go` no longer declares it).
+### 3.5 `config.go` — strip hotkey machinery
 
-- [x] **15. Implement `updateAutoConvertMenu(int enabled)` in `tray_darwin.m`.**
-  - [ ] Stores `autoConvertOn = enabled` and, on the main queue, sets `autoConvertItem.state = enabled ? NSControlStateValueOn : NSControlStateValueOff`.
-  - [ ] Guard against nil menu/item (called before `ensureApp`).
-  - [ ] Keep the function callable from any thread via `dispatch_async(dispatch_get_main_queue(), ^{ ... })`.
+- [x] Delete the `HotkeyConfig` struct (lines around 13–18).
+- [x] Delete the `Hotkeys HotkeyConfig` field from `Config`.
+- [x] Delete `defaultHotkeyConvertSelection` and `defaultHotkeyConvertLastWord` constants.
+- [x] Delete the `hotkeyFlagShift / hotkeyFlagControl / hotkeyFlagAlt / hotkeyFlagCommand` constant block (no remaining users — `kCGEventFlagMaskCommand` lives in `hook_darwin.go`; `anyModifierMask` lives in `hook_darwin.go`).
+- [x] Delete the `Hotkey` struct, `modifierMap`, `keyMap`, `ParseHotkey`, and `ParsedHotkeys`.
+- [x] In `DefaultConfig()`, remove the `Hotkeys: HotkeyConfig{...}` initializer.
+- [x] In `LoadConfig()`, remove the post-Unmarshal backfill block (`if cfg.Hotkeys.ConvertSelection == "" { ... }` and the `ConvertLastWord` equivalent) and the two log lines.
+- [x] Verify `gopkg.in/yaml.v3` is still imported (it is — used by Marshal/Unmarshal). *(Also dropped now-unused `fmt` and `log` imports.)*
 
-- [x] **16. Replace the old "⚡/💤" tray icon with flag emoji + initial layout probe.**
-  - [ ] In `ensureApp`, after creating `statusItem`, set the title using a new helper `setTrayTitleFromCurrentLayout()` that:
-    - [ ] Calls `TISCopyCurrentKeyboardInputSource()`, reads `kTISPropertyInputSourceID`, checks for case-insensitive substring `Russian`.
-    - [ ] Sets `statusItem.button.title = isRussian ? @"🇷🇺" : @"🇺🇸"`.
-    - [ ] Releases the copied source.
-  - [ ] Use a system emoji-capable font: `statusItem.button.font = [NSFont systemFontOfSize:14];` (already set; verify it renders the regional indicator pair as a flag — Apple Color Emoji fallback handles it).
+### 3.6 User config migration
 
-- [x] **17. Add `NSDistributedNotificationCenter` observer for layout changes.**
-  - [ ] Define a new class `LayoutObserver : NSObject` with method `- (void)layoutChanged:(NSNotification *)note { setTrayTitleFromCurrentLayout(); }`.
-  - [ ] In `ensureApp`, instantiate a singleton `LayoutObserver *layoutObserver` and register:
-    ```objc
-    [[NSDistributedNotificationCenter defaultCenter]
-        addObserver:layoutObserver
-        selector:@selector(layoutChanged:)
-        name:(NSString *)kTISNotifySelectedKeyboardInputSourceChanged
-        object:nil];
-    ```
-  - [ ] If `kTISNotifySelectedKeyboardInputSourceChanged` is not exposed in the SDK headers being used, fall back to the literal string `@"AppleSelectedInputSourcesChangedNotification"` AND `@"NSTextInputContextKeyboardSelectionDidChangeNotification"` (register for both to be safe).
-  - [ ] Ensure `setTrayTitleFromCurrentLayout()` always dispatches UI work to the main queue (`dispatch_async(dispatch_get_main_queue(), ^{ ... })`).
+- [x] No active code change. Document inline (comment near `LoadConfig`) that pre-existing `hotkeys:` keys in the on-disk config are silently ignored by `yaml.Unmarshal` (non-strict mode) and will be omitted on next `SaveConfig` write.
+- [x] No change to `.ai-factory/config.yaml` (that's the AI-Factory tooling config, unrelated to the app).
 
-### Phase 6 — Sanity check
+### 3.7 Tests
 
-- [x] **18. Build smoke check.**
-  - [x] Run `go build ./...` on macOS (informational here — current host is Linux). Cross-compile to darwin requires clang (not installed in this Linux env); verified `CGO_ENABLED=0 GOOS=windows go build ./...` succeeds, confirming `main.go` is consistent with the Windows stubs (added `setAutoConvertEnabled` / renamed `isTrayEnabled` → `isAutoConvertEnabled` in `replacer_windows.go`).
-  - [x] Verified via `Grep`: no `trayEnabled`, `isTrayEnabled`, `goTrayToggle`, `createTray`, `updateTray`, or `kCGEventFlagMaskShift` references remain in `*.go` / `*.m`. `macX`/`macC`/`macV` const definitions removed; `macZ` retained (still used by Cmd+Z undo handler).
-  - [ ] Manual verification on macOS (deferred — must be run by a human on macOS hardware):
-    - [ ] Tray shows 🇷🇺 / 🇺🇸 reflecting layout; switching layouts via Caps Lock / Cmd+Space updates icon within ~50ms.
-    - [ ] Cmd+Shift+X still converts selection.
-    - [ ] Cmd+Shift+Z converts the last word; pressing again immediately reverts.
-    - [ ] Pressing any letter or backspace after the conversion clears the toggle so a second Cmd+Shift+Z creates a fresh conversion (does not revert).
-    - [ ] Tray menu shows "Автоконвертация" with checkmark; toggling stops the buffer-callback auto-conversion path but keeps both manual hotkeys functional.
+- [x] Search confirms no test file references `ParseHotkey`, `ParsedHotkeys`, `HotkeyConfig`, `hotkeyFlag*`, `modifierMap`, or `keyMap` (`grep` over `*_test.go` returned zero hits in `detect_test.go`, `exceptions_test.go`, `integration_test.go`, `rollback_test.go`, `shifted_test.go`). No deletions needed. *(Re-verified post-implementation: zero hits across all `.go` files.)*
+- [x] No new tests are added under `tests: false`.
 
-## Commit Plan
+---
 
-- [ ] After Tasks 1–4: `feat(config): add hotkey config + auto-convert flag and parser`
-- [ ] After Tasks 5–10: `feat(hotkey): configurable hotkeys and last-word toggle`
-- [ ] After Tasks 11–13: `refactor(tray): replace pause with auto-convert toggle`
-- [ ] After Tasks 14–17: `feat(tray): dynamic flag icon via input-source notification`
-- [ ] After Task 18: `chore: smoke-check build and remove dead constants`
+## 4. Edge cases (verify in code)
+
+| Case | Expected behavior | Where enforced |
+|---|---|---|
+| Caps Lock held (auto-repeat) | Fires once. | OS only emits one `kCGEventFlagsChanged` per physical press; no extra logic. |
+| Cmd+CapsLock or Shift+CapsLock | No conversion; pass-through. | `(flags & ^capsLockMask & anyModifierMask) == 0` guard in `onKeyEvent`. |
+| Other modifier key (Shift/Cmd/Option) flagschanged | Ignored. | `keycode == capsLockKeyCode` guard. |
+| Empty buffer + no selection | Cmd+C is sent (harmless), clipboard restored, `convertLastWordFromBuffer` no-ops on empty `LastWord()`. | Existing `current == ""` branch. |
+| Selection in terminal that ignores Cmd+C | Clipboard unchanged → falls through to last-word path. | `selected == savedClipboard` branch in `handleCapsLock`. |
+| Excluded app | Caps Lock conversion still works (matches old hotkey behavior — runs before the `cfg.Enabled / IsAppExcluded` gate). | Branch placed at top of `onKeyEvent`. |
+| Toggle-back (second press without typing) | Works for last-word; not for selection (no toggle state set in selection path). | Existing `lastWord.active` semantics; selection path never calls `lastWord.Set`. |
+| Re-entry during our own Cmd+C / Cmd+V | `goKeyCallback` short-circuits when `replacing == 1`. | Already in `hook_darwin.go`. `handleCapsLock` raises the flag before `sendCopy` and lowers it on the no-selection branch before calling `convertLastWordFromBuffer` (which raises it itself in its goroutine). |
+
+---
+
+## 5. Risks and mitigations
+
+1. **100 ms latency on every Caps Lock press** (Cmd+C round trip). Acceptable for a manual hotkey; measurable but not painful. Mitigation: reduce sleep to 50 ms after manual smoke testing if reliable.
+2. **Cmd+C side effects in IDEs** (some apps copy current line on empty selection — that would falsely trigger the selection path). Mitigation: tested manually; if problematic, compare `selected` byte length / hash against `savedClipboard` more strictly. For now: documented risk.
+3. **Caps Lock LED toggling** despite event suppression — hardware-driven and not always controllable from the event tap. Document recommendation: System Settings → Keyboard → Modifier Keys → set Caps Lock to "No Action".
+4. **Compile breakage on Windows** if the `onKeyEvent` signature drifts. Mitigation: update `hook_windows.go` in the same commit (3.2).
+5. **Race between `replacing` flag toggles** in `handleCapsLock` and the goroutine inside `convertLastWordFromBuffer`. Window: `handleCapsLock` runs in its own goroutine, sets `replacing = 1`, sends Cmd+C, sleeps 100 ms, reads clipboard. On the no-selection branch it sets `replacing = 0` then calls `convertLastWordFromBuffer`, which spawns *another* goroutine that re-raises `replacing = 1`. Between the store-0 and the goroutine's store-1 there is a tiny window where a stray real keystroke would not be filtered. Mitigation: this is the same pattern as the existing `convertSelectedText` flow today; if it ever proves problematic, raise/lower the flag once around the *entire* flow instead of toggling between sub-steps.
+
+---
+
+## 6. Manual test checklist (run on macOS, dev build)
+
+- [ ] Type a wrong-layout Russian word in QWERTY → press Caps Lock → word converted to Cyrillic, layout switched.
+- [ ] Press Caps Lock again immediately (no other key) → word reverts to original (toggle).
+- [ ] Type a word, press space, press Caps Lock → last flushed word is converted (with the trailing space rebuilt).
+- [ ] Select a paragraph in TextEdit → Caps Lock → entire selection converted in place; clipboard restored.
+- [ ] Open IDE listed in `excluded_apps` → Caps Lock → conversion still works (manual hotkey bypasses the gate).
+- [ ] Empty document, no selection → Caps Lock → no-op, no errors in `~/Library/Logs` or `${TMPDIR}/ruswitch.log`.
+- [ ] Cmd+CapsLock → no conversion fires; passes through.
+- [ ] Hold Caps Lock for 1 s → exactly one conversion runs.
+- [ ] After conversion, type a normal letter → toggle window invalidated (verified by next Caps Lock re-converting from current buffer, not bouncing to the previous original).
+- [ ] Pre-existing user `~/Library/Application Support/RuSwitch/config.yaml` with `hotkeys:` block → app starts cleanly, log shows no parse error, file is rewritten without `hotkeys` after any config change.
+
+---
+
+## 7. Build / verification
+
+- [ ] `go build ./...` on macOS — must succeed with the new CGO callback signature.
+- [ ] `go vet ./...` — must pass.
+- [ ] `go test ./...` — existing tests must still pass (no test referenced removed symbols).
+- [ ] `make` (or the project's existing build target) produces a working `.app` bundle.
+
+---
+
+## 8. Rollback note
+
+If Caps Lock proves unworkable in the field (LED issues, IDE Cmd+C side effects), the smallest safe rollback is to reintroduce `convertSelectedText` as the body of a hardcoded Cmd+Shift+X check in `onKeyEvent` and re-add a hardcoded Ctrl+A check for last-word — *without* reintroducing the full `HotkeyConfig` plumbing. Keep the simplification.
