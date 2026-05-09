@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -236,6 +237,13 @@ func main() {
 		return
 	}
 
+	// Log to file so we can debug when running as .app bundle
+	logPath := filepath.Join(os.TempDir(), "ruswitch.log")
+	logFile, logErr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if logErr == nil {
+		log.SetOutput(logFile)
+	}
+
 	log.Println("RuSwitch starting...")
 
 	// Load config
@@ -348,6 +356,14 @@ func main() {
 
 	// Set up key event handler — called synchronously from CGEventTap
 	onKeyEvent = func(keycode uint16, char rune, flags int64) bool {
+		// Debug: log any key event with Command modifier
+		if (flags & hotkeyFlagCommand) != 0 {
+			log.Printf("DEBUG keyevent: keycode=0x%02X char=%d flags=0x%X | want_lw: kc=0x%02X mod=0x%X | want_sel: kc=0x%02X mod=0x%X",
+				keycode, char, flags,
+				lastWordHotkey.KeyCode, lastWordHotkey.Modifiers,
+				selectionHotkey.KeyCode, selectionHotkey.Modifiers)
+		}
+
 		// convert_last_word hotkey is checked BEFORE the cfg.Enabled /
 		// auto-convert gate (so it still works when auto-convert is off)
 		// AND before the Cmd+Z undo branch (so Cmd+Shift+Z is consumed
@@ -390,6 +406,11 @@ func main() {
 				return true
 			}
 
+			// If the current buffer is empty, LastWord() returned the
+			// last flushed word — meaning a space/boundary was already
+			// typed after it. We need to delete that trailing space too.
+			isFlushed := buf.IsBufferEmpty()
+
 			// Direction heuristic mirrors convertSelectedText: any Cyrillic
 			// → assume RU was typed in QWERTY layout, convert RU→QWERTY;
 			// otherwise QWERTY→RU.
@@ -410,7 +431,12 @@ func main() {
 			go func() {
 				atomic.StoreInt32(&replacing, 1)
 				buf.Clear()
-				for range current {
+
+				deleteCount := len([]rune(current))
+				if isFlushed {
+					deleteCount++ // delete the trailing space too
+				}
+				for i := 0; i < deleteCount; i++ {
 					sendBackspaceKey()
 					time.Sleep(5 * time.Millisecond)
 				}
@@ -419,29 +445,35 @@ func main() {
 					sendChar(ch)
 					time.Sleep(5 * time.Millisecond)
 				}
+				if isFlushed {
+					// Re-type the space we deleted
+					sendChar(' ')
+					time.Sleep(5 * time.Millisecond)
+				}
 				switchLang()
 				time.Sleep(30 * time.Millisecond)
 				// Arm the toggle window. The next convert_last_word press
 				// (with no real keystroke in between) will revert this.
 				lastWord.Set(current, converted)
 				atomic.StoreInt32(&replacing, 0)
-				log.Printf("convert_last_word: %q → %q", current, converted)
+				log.Printf("convert_last_word: %q → %q (flushed=%v)", current, converted, isFlushed)
 			}()
 			return true
 		}
 
-		if !cfg.Enabled || !isAutoConvertEnabled() {
-			return false
-		}
-
 		// Configurable selection-conversion hotkey (default Cmd+Shift+X).
-		// Exact-match-of-required-bits check (not full equality) because
-		// macOS sets device-dependent extra bits in the flags word.
+		// Checked BEFORE the auto-convert gate so it works even when
+		// auto-convert is off.
 		if keycode == selectionHotkey.KeyCode &&
-			(flags&selectionHotkey.Modifiers) == selectionHotkey.Modifiers {
+			(flags&selectionHotkey.Modifiers) == selectionHotkey.Modifiers &&
+			(flags & ^selectionHotkey.Modifiers & allModsMask) == 0 {
 			log.Printf("Manual convert hotkey (%s)", cfg.Hotkeys.ConvertSelection)
 			go convertSelectedText(detector)
 			return true // suppress the hotkey
+		}
+
+		if !cfg.Enabled || !isAutoConvertEnabled() {
+			return false
 		}
 
 		// Cmd+Z — undo last replacement (within 5 seconds)

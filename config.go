@@ -30,7 +30,7 @@ type Config struct {
 // LoadConfig backfill stay in sync.
 const (
 	defaultHotkeyConvertSelection = "Cmd+Shift+X"
-	defaultHotkeyConvertLastWord  = "Cmd+Shift+Z"
+	defaultHotkeyConvertLastWord  = "Ctrl+A"
 )
 
 // CGEventFlags modifier bitmasks (mirrors hook_darwin.go constants but kept

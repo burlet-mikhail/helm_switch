@@ -7,9 +7,10 @@ import (
 
 // Buffer collects keystrokes and emits words at boundaries
 type Buffer struct {
-	mu      sync.Mutex
-	chars   []rune
-	onWord  func(word string)
+	mu          sync.Mutex
+	chars       []rune
+	lastFlushed []rune // last word that was flushed (space/enter/punct boundary)
+	onWord      func(word string)
 }
 
 func NewBuffer(onWord func(string)) *Buffer {
@@ -31,9 +32,11 @@ func (b *Buffer) Add(r rune) {
 		if universalPunct[r] && len(b.chars) > 0 {
 			b.chars = append(b.chars, r)
 			emit = string(b.chars)
+			b.lastFlushed = append(b.lastFlushed[:0], b.chars...)
 			b.chars = b.chars[:0]
 		} else if len(b.chars) > 0 {
 			emit = string(b.chars)
+			b.lastFlushed = append(b.lastFlushed[:0], b.chars...)
 			b.chars = b.chars[:0]
 		}
 	} else {
@@ -70,24 +73,35 @@ func (b *Buffer) FlushWord() string {
 	if len(b.chars) == 0 {
 		return ""
 	}
+	b.lastFlushed = append(b.lastFlushed[:0], b.chars...)
 	word := string(b.chars)
 	b.chars = b.chars[:0]
 	return word
 }
 
-// LastWord returns the current buffered word WITHOUT mutating or flushing
-// the buffer. Used by the convert-last-word hotkey so that repeated
-// presses keep observing the same word until a real keystroke arrives.
-// Returns "" when the buffer is empty.
+// LastWord returns the current buffered word (if the user is mid-word)
+// or the last flushed word (if the user just pressed space/enter).
+// Does NOT mutate or flush the buffer. Used by the convert-last-word
+// hotkey so that it works both mid-word and after completing a word.
+// Returns "" when there is nothing to convert.
 func (b *Buffer) LastWord() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.chars) == 0 {
-		return ""
+	if len(b.chars) > 0 {
+		return string(b.chars)
 	}
-	// string(b.chars) copies the underlying runes, so the returned value
-	// is safe to use after we release b.mu and even if b.chars mutates.
-	return string(b.chars)
+	if len(b.lastFlushed) > 0 {
+		return string(b.lastFlushed)
+	}
+	return ""
+}
+
+// IsBufferEmpty returns true if the current typing buffer is empty.
+// Used to distinguish "mid-word" from "last flushed word" in LastWord().
+func (b *Buffer) IsBufferEmpty() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.chars) == 0
 }
 
 func isWordBoundary(r rune) bool {
