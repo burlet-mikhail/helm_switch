@@ -841,7 +841,45 @@ func main() {
 			return false
 		}
 
-		// Regular char — always accumulate in buffer.
+		// Command-modified keys (Cmd+C, Cmd+V, Cmd+Z, etc.) must NOT
+		// accumulate in the buffer — they are shortcuts, not typed text.
+		if (flags & kCGEventFlagMaskCommand) != 0 {
+			// Cmd+Z — undo last replacement (only when auto-convert is active)
+			if cfg.Enabled && isAutoConvertEnabled() && keycode == macZ {
+				original, replaced, ok := undo.Get()
+				if !ok {
+					return false
+				}
+				if store != nil {
+					app := FrontmostAppID()
+					if err := store.Add(app, original); err == nil {
+						log.Printf("Learned exception (Cmd+Z): %q in %q", original, app)
+					}
+				}
+				log.Printf("Undo: reverting %q → %q", replaced, original)
+				go func() {
+					atomic.StoreInt32(&replacing, 1)
+					buf.Clear()
+					for i := 0; i < len([]rune(replaced)); i++ {
+						sendBackspaceKey()
+						time.Sleep(5 * time.Millisecond)
+					}
+					time.Sleep(10 * time.Millisecond)
+					for _, ch := range original {
+						sendChar(ch)
+						time.Sleep(5 * time.Millisecond)
+					}
+					switchLang()
+					time.Sleep(30 * time.Millisecond)
+					atomic.StoreInt32(&replacing, 0)
+				}()
+				return true
+			}
+			// All other Cmd+key combos: pass through without touching buffer.
+			return false
+		}
+
+		// Regular char (no Command modifier) — accumulate in buffer.
 		lastWord.Reset()
 		buf.Add(char)
 		if tracker != nil {
@@ -851,50 +889,11 @@ func main() {
 			}
 		}
 
-		// --- Auto-convert gated features below ---
-		if !cfg.Enabled || !isAutoConvertEnabled() {
-			return false
-		}
-
-		// Cmd+Z — undo last replacement (within 5 seconds)
-		if keycode == macZ && (flags&kCGEventFlagMaskCommand) != 0 {
-			original, replaced, ok := undo.Get()
-			if !ok {
-				return false
-			}
-			if store != nil {
-				app := FrontmostAppID()
-				if err := store.Add(app, original); err == nil {
-					log.Printf("Learned exception (Cmd+Z): %q in %q", original, app)
-				}
-			}
-			log.Printf("Undo: reverting %q → %q", replaced, original)
-			go func() {
-				atomic.StoreInt32(&replacing, 1)
-				buf.Clear()
-				for i := 0; i < len([]rune(replaced)); i++ {
-					sendBackspaceKey()
-					time.Sleep(5 * time.Millisecond)
-				}
-				time.Sleep(10 * time.Millisecond)
-				for _, ch := range original {
-					sendChar(ch)
-					time.Sleep(5 * time.Millisecond)
-				}
-				switchLang()
-				time.Sleep(30 * time.Millisecond)
-				atomic.StoreInt32(&replacing, 0)
-			}()
-			return true
-		}
-
-		// Any other key clears undo window
-		if keycode != macBackspace && char != 0 {
-			if (flags & kCGEventFlagMaskCommand) == 0 {
-				undo.mu.Lock()
-				undo.original = ""
-				undo.mu.Unlock()
-			}
+		// Clear undo window on real keystrokes
+		if cfg.Enabled && isAutoConvertEnabled() {
+			undo.mu.Lock()
+			undo.original = ""
+			undo.mu.Unlock()
 		}
 
 		return false
