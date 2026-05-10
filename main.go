@@ -529,17 +529,42 @@ func convertLastWordFromBuffer(buf *Buffer) {
 	}()
 }
 
-// handleCapsLock is the single Caps Lock entry point: detects whether the
-// user has a selection (by save → Cmd+C → diff clipboard) and dispatches to
-// the selection-conversion path or the last-word path accordingly.
+// handleCapsLock is the single Caps Lock entry point. Priority order:
+//
+//  1. If the toggle-back window is armed → revert (last-word path).
+//  2. If the user is mid-word (buffer.chars > 0) → convert last word
+//     directly. No Cmd+C needed because you can't have a selection while
+//     actively typing.
+//  3. Otherwise (buffer empty, user finished typing or is selecting) →
+//     probe for selection via Cmd+C. If found → convert selection.
+//     If not found → fall back to converting the last flushed word.
+//
+// This ordering avoids sending Cmd+C when it's unnecessary (mid-typing),
+// which prevents side effects in apps that react to Cmd+C without a
+// selection (search bars, line-copy in IDEs, etc.).
 //
 // Runs in its own goroutine (spawned from onKeyEvent) because it involves
 // keystroke synthesis and clipboard I/O that must not block the event tap.
 func handleCapsLock(buf *Buffer, detector *Detector) {
+	// Fast path 1: toggle-back is armed — always last-word path.
+	_, _, toggleActive := lastWord.Snapshot()
+	if toggleActive {
+		convertLastWordFromBuffer(buf)
+		return
+	}
+
+	// Fast path 2: user is mid-word (actively typing). A text selection
+	// can't coexist with an active caret in the same text field, so skip
+	// the clipboard probe.
+	if !buf.IsBufferEmpty() {
+		convertLastWordFromBuffer(buf)
+		return
+	}
+
+	// Slow path: buffer is empty (user finished typing, or moved cursor/
+	// selected text). Probe for a selection via Cmd+C → clipboard diff.
 	savedClipboard := readClipboard()
 
-	// Raise the replacing flag BEFORE sending Cmd+C so our own copy doesn't
-	// re-enter the hook handler.
 	atomic.StoreInt32(&replacing, 1)
 	sendCopy()
 	time.Sleep(100 * time.Millisecond)
@@ -547,15 +572,13 @@ func handleCapsLock(buf *Buffer, detector *Detector) {
 	selected := readClipboard()
 
 	if selected != "" && selected != savedClipboard {
-		// Selection path — finishSelectionConvert keeps the replacing flag
-		// raised through paste/restore and clears it at the end.
+		// Selection found — convert it.
 		finishSelectionConvert(detector, savedClipboard, selected)
 		return
 	}
 
-	// No selection: restore the clipboard, drop the replacing flag, then run
-	// the last-word path. (convertLastWordFromBuffer raises the flag again
-	// inside its own goroutine for the actual backspace+type sequence.)
+	// No selection found. Restore clipboard, then fall back to converting
+	// the last flushed word (if any).
 	atomic.StoreInt32(&replacing, 0)
 	if savedClipboard != "" {
 		writeClipboard(savedClipboard)
@@ -733,6 +756,102 @@ func main() {
 			return true // suppress so no other app sees F18
 		}
 
+		// --- Buffer accumulation: ALWAYS runs regardless of auto-convert ---
+		// The buffer must track keystrokes even when auto-convert is off so
+		// that the Caps Lock manual conversion (which is gated separately
+		// above) has something to work with.
+
+		// Backspace
+		if keycode == macBackspace {
+			lastWord.Reset()
+			buf.Backspace()
+			if tracker != nil {
+				tracker.ObserveKey(KeyObservation{Kind: KeyKindBackspace})
+			}
+			return false
+		}
+
+		// Skip null chars and modifier-only events
+		if char == 0 || char == 0x08 {
+			return false
+		}
+
+		// Enter/Return flushes the buffer (so LastWord can find the word).
+		if keycode == macReturn || keycode == macEnter || char == '\r' || char == '\n' {
+			word := buf.FlushWord()
+
+			// Auto-correction on Enter: only when enabled.
+			if word != "" && cfg.Enabled && isAutoConvertEnabled() {
+				if cfg.MinWordLength > 0 && len([]rune(word)) < cfg.MinWordLength {
+					return false
+				}
+				if looksLikeContext(word) {
+					return false
+				}
+				app := FrontmostAppID()
+				if cfg.IsAppExcluded(app) {
+					return false
+				}
+				if store != nil && store.IsException(app, word) {
+					log.Printf("Exception skip (enter): %q in %q", word, app)
+					return false
+				}
+
+				wrong, corrected := detector.Check(word)
+				if !wrong {
+					return false
+				}
+
+				go func() {
+					log.Printf("Fix (enter): %q → %q", word, corrected)
+					atomic.StoreInt32(&replacing, 1)
+					buf.Clear()
+
+					wordRunes := []rune(word)
+					for i := 0; i < len(wordRunes); i++ {
+						sendBackspaceKey()
+						time.Sleep(5 * time.Millisecond)
+					}
+					time.Sleep(10 * time.Millisecond)
+
+					newText := corrected
+					for _, ch := range corrected {
+						sendChar(ch)
+						time.Sleep(5 * time.Millisecond)
+					}
+
+					undo.Save(word, newText)
+					if tracker != nil {
+						tracker.OnConversion(word, newText, FrontmostAppID())
+					}
+
+					switchLang()
+					time.Sleep(30 * time.Millisecond)
+					atomic.StoreInt32(&replacing, 0)
+
+					time.Sleep(10 * time.Millisecond)
+					sendEnter()
+				}()
+				return true
+			}
+
+			if tracker != nil {
+				tracker.ObserveKey(KeyObservation{Kind: KeyKindOther})
+			}
+			return false
+		}
+
+		// Regular char — always accumulate in buffer.
+		lastWord.Reset()
+		buf.Add(char)
+		if tracker != nil {
+			res := tracker.ObserveKey(KeyObservation{Kind: KeyKindChar, Rune: char})
+			if res.RollbackDetected {
+				log.Printf("Learned exception (retype): %q in %q", res.Word, res.App)
+			}
+		}
+
+		// --- Auto-convert gated features below ---
 		if !cfg.Enabled || !isAutoConvertEnabled() {
 			return false
 		}
@@ -741,9 +860,8 @@ func main() {
 		if keycode == macZ && (flags&kCGEventFlagMaskCommand) != 0 {
 			original, replaced, ok := undo.Get()
 			if !ok {
-				return false // no recent replacement, let Cmd+Z pass to app
+				return false
 			}
-			// Explicit user rejection — learn this as an exception.
 			if store != nil {
 				app := FrontmostAppID()
 				if err := store.Add(app, original); err == nil {
@@ -754,31 +872,24 @@ func main() {
 			go func() {
 				atomic.StoreInt32(&replacing, 1)
 				buf.Clear()
-
-				// Delete the replaced text
 				for i := 0; i < len([]rune(replaced)); i++ {
 					sendBackspaceKey()
 					time.Sleep(5 * time.Millisecond)
 				}
 				time.Sleep(10 * time.Millisecond)
-
-				// Type original text back
 				for _, ch := range original {
 					sendChar(ch)
 					time.Sleep(5 * time.Millisecond)
 				}
-
-				// Switch layout back
 				switchLang()
 				time.Sleep(30 * time.Millisecond)
 				atomic.StoreInt32(&replacing, 0)
 			}()
-			return true // suppress Cmd+Z
+			return true
 		}
 
-		// Any other key clears undo window (user moved on)
+		// Any other key clears undo window
 		if keycode != macBackspace && char != 0 {
-			// Don't clear on modifier-only keys
 			if (flags & kCGEventFlagMaskCommand) == 0 {
 				undo.mu.Lock()
 				undo.original = ""
@@ -786,99 +897,6 @@ func main() {
 			}
 		}
 
-		// Backspace
-		if keycode == macBackspace {
-			// Editing invalidates the convert_last_word toggle window:
-			// the buffer no longer matches what we last converted.
-			lastWord.Reset()
-			buf.Backspace()
-			if tracker != nil {
-				tracker.ObserveKey(KeyObservation{Kind: KeyKindBackspace})
-			}
-			return false
-		}
-
-		// Skip null chars
-		if char == 0 || char == 0x08 {
-			return false
-		}
-
-		// Enter/Return — check word BEFORE letting Enter through
-		if keycode == macReturn || keycode == macEnter || char == '\r' || char == '\n' {
-			word := buf.FlushWord()
-			if word == "" {
-				if tracker != nil {
-					tracker.ObserveKey(KeyObservation{Kind: KeyKindOther})
-				}
-				return false
-			}
-
-			// Respect min word length, context filter, and excluded apps on Enter path too.
-			if cfg.MinWordLength > 0 && len([]rune(word)) < cfg.MinWordLength {
-				return false
-			}
-			if looksLikeContext(word) {
-				return false
-			}
-			app := FrontmostAppID()
-			if cfg.IsAppExcluded(app) {
-				return false
-			}
-			if store != nil && store.IsException(app, word) {
-				log.Printf("Exception skip (enter): %q in %q", word, app)
-				return false
-			}
-
-			wrong, corrected := detector.Check(word)
-			if !wrong {
-				return false
-			}
-
-			go func() {
-				log.Printf("Fix (enter): %q → %q", word, corrected)
-				atomic.StoreInt32(&replacing, 1)
-				buf.Clear()
-
-				wordRunes := []rune(word)
-				for i := 0; i < len(wordRunes); i++ {
-					sendBackspaceKey()
-					time.Sleep(5 * time.Millisecond)
-				}
-				time.Sleep(10 * time.Millisecond)
-
-				newText := corrected
-				for _, ch := range corrected {
-					sendChar(ch)
-					time.Sleep(5 * time.Millisecond)
-				}
-
-				undo.Save(word, newText)
-				if tracker != nil {
-					tracker.OnConversion(word, newText, FrontmostAppID())
-				}
-
-				switchLang()
-				time.Sleep(30 * time.Millisecond)
-				atomic.StoreInt32(&replacing, 0)
-
-				time.Sleep(10 * time.Millisecond)
-				sendEnter()
-			}()
-			return true
-		}
-
-		// Regular char — any real keystroke invalidates the
-		// convert_last_word toggle window. The earlier guard skips
-		// modifier-only events (char == 0) before reaching here, so this
-		// only fires for actual typed characters.
-		lastWord.Reset()
-		buf.Add(char)
-		if tracker != nil {
-			res := tracker.ObserveKey(KeyObservation{Kind: KeyKindChar, Rune: char})
-			if res.RollbackDetected {
-				log.Printf("Learned exception (retype): %q in %q", res.Word, res.App)
-			}
-		}
 		return false
 	}
 

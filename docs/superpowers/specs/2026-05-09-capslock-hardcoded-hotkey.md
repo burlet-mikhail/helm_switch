@@ -22,48 +22,69 @@ Caps Lock becomes единственной горячей клавишей дл�
 
 ---
 
-## 2. Как macOS сообщает о Caps Lock
+## 2. Почему нельзя перехватить Caps Lock через CGEventTap
 
-Caps Lock в macOS — **не** обычный `kCGEventKeyDown`. Это `kCGEventFlagsChanged` (тип 12). Keycode Caps Lock = `0x39` (57). При нажатии выставляется флаг `NX_ALPHASHIFTMASK` (1 << 16 = 0x10000).
+Caps Lock на macOS обрабатывается на уровне IOKit HID **до** event tap. Возврат NULL из CGEventTap callback **не подавляет** Caps Lock — OS всё равно:
+- Переключает состояние Caps Lock (LED, регистр)
+- Может показать переключатель раскладки (если настроен)
+- Отправляет `kCGEventFlagsChanged` чисто как уведомление, а не как перехватываемое событие
 
-### Текущая проблема
-
-`hook_darwin.go` перехватывает только `kCGEventKeyDown`:
-
-```c
-CGEventMask mask = (1 << kCGEventKeyDown);
-```
-
-Caps Lock **не попадает** в текущий event tap.
-
-### Решение
-
-Расширить маску событий, добавив `kCGEventFlagsChanged`:
-
-```c
-CGEventMask mask = (1 << kCGEventKeyDown) | (1 << kCGEventFlagsChanged);
-```
+Попытка ловить `kCGEventFlagsChanged` + keycode `0x39` и подавлять — **не работает**.
 
 ---
 
-## 3. Детекция нажатия Caps Lock
+## 3. Решение: hidutil remap Caps Lock → F18
 
-В `goKeyCallback` / `onKeyEvent` нужно отличить Caps Lock от других modifier-only событий (Shift, Cmd и т.д.).
+### Подход
 
-Алгоритм:
+Используем `hidutil` для ремаппинга Caps Lock → F18 на уровне HID-драйвера. После ремаппинга:
+- Физическая клавиша Caps Lock генерирует **обычный `kCGEventKeyDown`** с keycode F18 (`0x4F` = 79)
+- Caps Lock LED **не загорается** — ОС не знает что нажат Caps Lock
+- Event tap может **полностью подавить** F18 через return NULL
+- Никаких побочных эффектов (переключатель раскладки, смена регистра)
 
-1. Событие `kCGEventFlagsChanged` с keycode `0x39` — это Caps Lock
-2. Реагируем **только на нажатие** (флаг `NX_ALPHASHIFTMASK` появился), игнорируем отпускание
-3. **Подавляем событие** (return NULL) — чтобы Caps Lock не переключал регистр в системе
+### Команды hidutil
 
-### Подавление стандартного поведения Caps Lock
+**Установка ремаппинга** (Caps Lock → F18):
+```bash
+hidutil property --set '{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0x700000039,"HIDKeyboardModifierMappingDst":0x70000006D}]}'
+```
 
-При подавлении через event tap (return NULL) — Caps Lock LED может не выключиться / вести себя непредсказуемо. Два подхода:
+- `0x700000039` = USB HID usage code для Caps Lock
+- `0x70000006D` = USB HID usage code для F18
 
-- **Вариант A (рекомендуемый):** Использовать `hidutil` или IOKit для ремаппинга Caps Lock → no-op на уровне системы, а в event tap ловить `0x39` чисто для логики. Но это требует действий от пользователя.
-- **Вариант B (реалистичный):** Подавлять через event tap. LED будет toggle-иться, но функционально это не мешает. Документировать рекомендацию: "Переназначьте Caps Lock на No Action в System Settings > Keyboard > Modifier Keys".
+**Сброс ремаппинга** (восстановление Caps Lock):
+```bash
+hidutil property --set '{"UserKeyMapping":[]}'
+```
 
-**Выбор: Вариант B** — проще реализовать, LED-toggle не критичен.
+### Жизненный цикл
+
+1. **При старте** (`main()`, до `startHook()`) — установить ремаппинг через `exec.Command("hidutil", ...)`
+2. **При завершении** (signal handler + `defer`) — сбросить ремаппинг
+3. Ремаппинг `hidutil` действует до перезагрузки и не требует root — идеально для user-space приложения
+
+### Важно: сохранение существующих ремаппингов
+
+Перед установкой нужно прочитать текущие `UserKeyMapping` через `hidutil property --get "UserKeyMapping"`, добавить наш ремаппинг к существующим (если есть), и при сбросе — восстановить оригинальные, а не очищать всё.
+
+---
+
+## 3a. Детекция F18 в event tap
+
+После ремаппинга Caps Lock приходит как **обычный `kCGEventKeyDown`** — не нужен `kCGEventFlagsChanged`:
+
+```go
+const f18KeyCode uint16 = 0x4F // 79 — macOS virtual keycode для F18
+```
+
+В `onKeyEvent`: если `eventType == kCGEventTypeKeyDown && keycode == f18KeyCode` → вызвать `handleCapsLock()`, return true (suppress).
+
+### Что упрощается
+
+- Event mask — **только `kCGEventKeyDown`** (как было до этой фичи)
+- `goKeyCallback` / `onKeyEvent` — **не нужен параметр `eventType`** (можно вернуть к оригинальной сигнатуре)
+- Не нужны константы `kCGEventTypeFlagsChanged`, `capsLockMask`, `anyModifierMask`
 
 ---
 
@@ -139,49 +160,62 @@ func handleCapsLock() {
 
 ### `hook_darwin.go`
 
-| Что | Изменение |
-|-----|-----------|
-| Event mask | Добавить `kCGEventFlagsChanged` в маску |
-| `eventCallback` | Обрабатывать `kCGEventFlagsChanged`: извлекать keycode и flags, вызывать `goKeyCallback` с дополнительным параметром типа события |
-| `goKeyCallback` | Новая сигнатура: добавить параметр `eventType` чтобы отличать key-down от flags-changed |
-| `onKeyEvent` | Новая сигнатура: добавить `eventType` |
+| Что                  | Изменение                                                                                            |
+|----------------------|------------------------------------------------------------------------------------------------------|
+| Event mask           | **Вернуть** к `(1 << kCGEventKeyDown)` — убрать `kCGEventFlagsChanged`                              |
+| `eventCallback`      | **Вернуть** к оригиналу — обрабатывать только `kCGEventKeyDown`                                     |
+| `goKeyCallback`      | **Вернуть** оригинальную сигнатуру: `(keycode, character, flags)` — убрать `eventType`               |
+| `onKeyEvent`         | **Вернуть** оригинальную сигнатуру: `(keycode uint16, char rune, flags int64) bool`                  |
+| Убрать константы     | Удалить `kCGEventTypeFlagsChanged`, `capsLockKeyCode`, `capsLockMask`, `anyModifierMask`             |
+| Новая константа      | `f18KeyCode uint16 = 0x4F` (79)                                                                     |
 
 ### `main.go`
 
-| Что | Изменение |
-|-----|-----------|
-| Caps Lock handler | Новый блок в `onKeyEvent`: если `eventType == kCGEventFlagsChanged && keycode == 0x39 && (flags & capsLockMask) != 0` → вызвать `handleCapsLock()` |
-| `handleCapsLock()` | Новая функция: определяет наличие выделения, делегирует в нужный путь |
-| Удалить hotkey checks | Убрать блоки проверки `lastWordHotkey` и `selectionHotkey` |
-| Удалить `ParsedHotkeys()` вызов | Больше не нужен в `main()` |
+| Что                       | Изменение                                                                                       |
+|---------------------------|-------------------------------------------------------------------------------------------------|
+| `remapCapsLockToF18()`    | Новая функция: вызывает `hidutil` для ремаппинга Caps Lock → F18                               |
+| `restoreCapsLock()`       | Новая функция: сбрасывает ремаппинг (вызывается в signal handler + defer)                       |
+| `main()` init             | Вызвать `remapCapsLockToF18()` перед `startHook()`, добавить `defer restoreCapsLock()`          |
+| Signal handler            | Добавить `restoreCapsLock()` перед `os.Exit(0)`                                                |
+| F18 handler в `onKeyEvent`| Если `keycode == f18KeyCode` → `go handleCapsLock(buf, detector)`, return true                  |
+| `onKeyEvent` сигнатура    | Вернуть к `(keycode uint16, char rune, flags int64) bool` — без `eventType`                     |
 
 ### `config.go`
 
-| Что | Изменение |
-|-----|-----------|
-| `HotkeyConfig` | Удалить struct целиком |
-| `Config.Hotkeys` | Удалить поле |
-| `ParseHotkey()` | Удалить функцию |
-| `ParsedHotkeys()` | Удалить метод |
-| Hotkey constants | Удалить `defaultHotkeyConvertSelection`, `defaultHotkeyConvertLastWord` |
-| Modifier/key maps | Удалить `modifierMap`, `keyMap` |
-| `DefaultConfig()` | Убрать `Hotkeys` из дефолтов |
-| `LoadConfig()` | Убрать backfill логику для hotkeys |
+Без изменений (уже вычищен в предыдущей итерации).
+
+### `hook_windows.go`
+
+| Что                  | Изменение                                                                              |
+|----------------------|----------------------------------------------------------------------------------------|
+| `onKeyEvent`         | Вернуть оригинальную сигнатуру без `eventType`                                         |
+| Убрать константы     | Удалить `kCGEventTypeKeyDown`, `kCGEventTypeFlagsChanged`, `capsLockKeyCode` и т.д.    |
+| Новая константа      | `f18KeyCode uint16 = 0x4F` (dead code на Windows, но нужен для компиляции `main.go`)   |
 
 ### `config.yaml`
 
-Убрать секцию `hotkeys` целиком. Старые конфиги с секцией `hotkeys` — YAML-парсер просто проигнорирует неизвестные поля (уже работает так).
+Без изменений (секция `hotkeys` уже убрана).
 
 ---
 
-## 7. Новые константы
+## 7. Новые константы и функции
 
 ```go
-const (
-    kCGEventFlagsChanged = 12
-    capsLockKeyCode      = 0x39  // 57
-    capsLockMask   int64 = 1 << 16  // NX_ALPHASHIFTMASK / kCGEventFlagMaskAlphaShift
-)
+const f18KeyCode uint16 = 0x4F // 79 — macOS virtual keycode для F18
+
+// remapCapsLockToF18 вызывает hidutil для ремаппинга Caps Lock → F18.
+// Caps Lock (USB HID 0x700000039) → F18 (USB HID 0x70000006D).
+func remapCapsLockToF18() error {
+    cmd := exec.Command("hidutil", "property", "--set",
+        `{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0x700000039,"HIDKeyboardModifierMappingDst":0x70000006D}]}`)
+    return cmd.Run()
+}
+
+// restoreCapsLock сбрасывает hidutil ремаппинг.
+func restoreCapsLock() {
+    exec.Command("hidutil", "property", "--set",
+        `{"UserKeyMapping":[]}`).Run()
+}
 ```
 
 ---
@@ -190,12 +224,15 @@ const (
 
 | Кейс | Поведение |
 |------|-----------|
-| Caps Lock зажат долго (key repeat) | `kCGEventFlagsChanged` не повторяется — сработает ровно 1 раз |
-| Caps Lock + другой modifier (Cmd+CapsLock) | Игнорировать — реагировать только на чистый Caps Lock |
-| Пустой буфер + нет выделения | No-op, Caps Lock подавлен |
-| Выделение в терминале (не поддерживает Cmd+C) | Clipboard не изменится → fallback на последнее слово. Приемлемо |
-| Приложение из excluded_apps | Caps Lock конвертация работает всегда (как текущие хоткеи — checked before enabled gate) |
-| Toggle (повторное нажатие) | Работает только для режима "последнее слово". Для selection — нет toggle |
+| F18 зажат долго (key repeat)                       | F18 как обычная клавиша может генерировать repeat — проверить `isRepeat` flag (bit 0 CGEventFlags), либо не проблема если handleCapsLock идемпотентна |
+| Caps Lock + другой modifier (Cmd+CapsLock)         | После ремаппинга это Cmd+F18 — проверять `(flags & allModsMask) == 0`, реагировать только на чистый F18 |
+| Пустой буфер + нет выделения                       | No-op, F18 подавлен                                                                                   |
+| Выделение в терминале (не поддерживает Cmd+C)       | Clipboard не изменится → fallback на последнее слово. Приемлемо                                        |
+| Приложение из excluded_apps                         | Конвертация работает всегда (checked before enabled gate)                                              |
+| Toggle (повторное нажатие)                          | Работает только для режима "последнее слово". Для selection — нет toggle                                |
+| hidutil не установлен / ошибка                      | Логировать warning, продолжить без Caps Lock хоткея — приложение работает, просто без ручной конвертации |
+| Пользователь уже имеет свои hidutil ремаппинги      | Читать существующие маппинги, добавлять наш, при выходе — восстанавливать оригинальные                 |
+| Крэш без вызова restoreCapsLock()                   | Caps Lock останется как F18 до перезагрузки. Документировать: `hidutil property --set '{"UserKeyMapping":[]}'` для ручного сброса |
 
 ---
 
@@ -219,17 +256,22 @@ const (
 
 2. **Побочный эффект Cmd+C без выделения** — в некоторых приложениях Cmd+C без выделения может давать side-effect (например, копировать текущую строку в IDE). Mitigation: проверить на целевых приложениях.
 
-3. **Caps Lock LED** — будет toggle-иться даже при подавлении события. Рекомендация пользователю: переназначить Caps Lock в System Settings.
+3. **Крэш оставляет Caps Lock заремапленным** — если приложение крэшнет без вызова `restoreCapsLock()`, Caps Lock останется F18 до перезагрузки. Mitigation: документировать команду ручного сброса, рассмотреть launchd watchdog.
+
+4. **Конфликт с существующими hidutil ремаппингами** — пользователь может уже иметь свои ремаппинги (например Karabiner). Mitigation: читать текущие маппинги перед изменением, мержить, восстанавливать при выходе.
 
 ---
 
 ## 11. Тестирование
 
-- **Unit tests:** проверка определения `kCGEventFlagsChanged` + keycode 0x39
-- **Удалить тесты** для `ParseHotkey()` (функция удалена)
+- **Unit tests:** проверка `remapCapsLockToF18()` / `restoreCapsLock()` (mock exec)
 - **Manual testing:**
+  - `hidutil property --get "UserKeyMapping"` — проверить что ремаппинг установлен при запуске
   - Набрать слово на неправильной раскладке → Caps Lock → слово конвертировано
   - Повторный Caps Lock → откат (toggle)
   - Выделить текст → Caps Lock → выделение конвертировано
   - Caps Lock в excluded app → конвертация все равно работает
   - Caps Lock при пустом буфере и без выделения → ничего не происходит
+  - Caps Lock LED **не загорается** при нажатии
+  - Завершить приложение (Ctrl+C) → `hidutil property --get "UserKeyMapping"` пуст → Caps Lock работает нормально
+  - Kill -9 приложения → Caps Lock остается F18 → ручной сброс через `hidutil property --set '{"UserKeyMapping":[]}'`

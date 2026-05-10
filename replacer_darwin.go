@@ -55,6 +55,12 @@ static void sendCmdV(void) {
 void sendBackspace(void) {
     CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0x33, true);
     CGEventRef up   = CGEventCreateKeyboardEvent(NULL, 0x33, false);
+    // Explicitly clear modifier flags so a preceding Cmd+C (sendCmdC) doesn't
+    // leave Command "stuck" — CGEventCreateKeyboardEvent inherits the current
+    // system modifier state, which can include stale bits from our own
+    // synthetic Cmd+C/V events.
+    CGEventSetFlags(down, 0);
+    CGEventSetFlags(up, 0);
     CGEventPost(kCGHIDEventTap, down);
     CGEventPost(kCGHIDEventTap, up);
     CFRelease(down);
@@ -82,6 +88,8 @@ static CGKeyCode physicalKeycode(UniChar ch) {
 void sendEnter(void) {
     CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0x24, true);
     CGEventRef up   = CGEventCreateKeyboardEvent(NULL, 0x24, false);
+    CGEventSetFlags(down, 0);
+    CGEventSetFlags(up, 0);
     CGEventPost(kCGHIDEventTap, down);
     CGEventPost(kCGHIDEventTap, up);
     CFRelease(down);
@@ -92,6 +100,8 @@ void sendUnichar(UniChar ch) {
     CGKeyCode kc = physicalKeycode(ch);
     CGEventRef down = CGEventCreateKeyboardEvent(NULL, kc, true);
     CGEventRef up   = CGEventCreateKeyboardEvent(NULL, kc, false);
+    CGEventSetFlags(down, 0);
+    CGEventSetFlags(up, 0);
     UniChar c[1] = {ch};
     CGEventKeyboardSetUnicodeString(down, 1, c);
     CGEventKeyboardSetUnicodeString(up, 1, c);
