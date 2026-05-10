@@ -54,26 +54,26 @@ var (
 )
 
 // onKeyEvent is set by main() — called synchronously from hook callback.
-// Returns true to suppress the event (Windows: not supported yet, returns 0 anyway).
-// eventType mirrors the macOS CGEventType (10 = key down, 12 = flags changed)
-// purely so the cross-platform signature stays consistent. On Windows we only
-// see "key down"-equivalent events through WH_KEYBOARD_LL, so eventType is
-// hard-coded to kCGEventTypeKeyDown — flags-changed interception (Caps Lock
-// as a hotkey) is not implemented here.
-var onKeyEvent func(eventType int64, keycode uint16, char rune, flags int64) bool
+// Returns true to suppress the event (Windows: not supported yet, returns
+// 0 anyway). Signature mirrors hook_darwin.go so main.go compiles on both
+// platforms without build tags.
+var onKeyEvent func(keycode uint16, char rune, flags int64) bool
 
-// Mirrors of the macOS CGEventType / Caps Lock constants so main.go can be
-// built on Windows without build-tagged switches. On Windows the LL keyboard
-// hook only delivers key-down-equivalent events (we always pass
-// kCGEventTypeKeyDown to onKeyEvent), so the kCGEventTypeFlagsChanged branch
-// in main.go is never reached and the Caps Lock constants are dead code on
-// this platform.
+// Mirrors of the macOS constants used by main.go. The Caps Lock → F18
+// HID-level remap is macOS-only; on Windows the Caps Lock hotkey path
+// simply never fires (no remap, no F18 events).
+//
+// IMPORTANT: f18KeyCode must be a sentinel value that no real Windows VK
+// can produce. The macOS virtual keycode for F18 is 0x4F, but on Windows
+// 0x4F is VK_O — every "O" keystroke would otherwise match the F18
+// dispatch in main.go's onKeyEvent (since the Windows hook always passes
+// flags=0, the `flags&anyRealModifierMask == 0` guard would fire on every
+// plain "O" press) and spawn handleCapsLock → convertLastWordFromBuffer,
+// mangling user input. Windows VK codes are documented as 0x00–0xFE, so
+// 0xFFFF can never collide with a real key.
 const (
-	kCGEventTypeKeyDown      int64  = 10
-	kCGEventTypeFlagsChanged int64  = 12
-	capsLockKeyCode          uint16 = 0x39
-	capsLockMask             int64  = 1 << 16
-	anyModifierMask          int64  = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)
+	f18KeyCode          uint16 = 0xFFFF
+	anyRealModifierMask int64  = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)
 )
 
 // Windows key event masks (placeholder for compat with macOS code)
@@ -94,10 +94,9 @@ func startHook() error {
 				if onKeyEvent != nil {
 					// Windows: can't easily suppress via LL hook callback, so always pass through.
 					// Enter interception is limited compared to macOS.
-					// Pass kCGEventTypeKeyDown for eventType — flags-changed
-					// interception (Caps Lock as a hotkey) is not implemented
-					// on Windows, only on macOS.
-					onKeyEvent(kCGEventTypeKeyDown, uint16(kb.VkCode), ch, 0)
+					// Caps Lock as a hotkey is not implemented on Windows
+					// (no hidutil-equivalent HID-level remap is wired up).
+					onKeyEvent(uint16(kb.VkCode), ch, 0)
 				}
 			}
 			ret, _, _ := procCallNextHook.Call(hookHandle, uintptr(nCode), wParam, lParam)

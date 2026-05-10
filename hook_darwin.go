@@ -11,10 +11,14 @@ package main
 #include <ApplicationServices/ApplicationServices.h>
 
 // goKeyCallback returns 1 to suppress the event, 0 to pass through.
-// eventType is the CGEventType (10 = key down, 12 = flags changed) so the Go
-// side can branch — Caps Lock arrives as kCGEventFlagsChanged with no
-// character data.
-extern int goKeyCallback(int64_t eventType, int64_t keycode, UniChar character, int64_t flags);
+// Only fires for kCGEventKeyDown — Caps Lock is delivered as F18 (keycode
+// 0x4F) thanks to the hidutil remap installed at startup, so we no longer
+// need the flags-changed path that previously listened for Caps Lock.
+extern int goKeyCallback(int64_t keycode, UniChar character, int64_t flags);
+
+// f18VirtualKeyCode mirrors `f18KeyCode` on the Go side — kept inline here
+// so the C autorepeat-skip branch doesn't need to call into Go.
+#define F18_VIRTUAL_KEYCODE 0x4F
 
 static CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
@@ -22,21 +26,27 @@ static CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEvent
         return event;
     }
 
-    if (type != kCGEventKeyDown && type != kCGEventFlagsChanged) return event;
+    if (type != kCGEventKeyDown) return event;
 
     CGKeyCode keycode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
     CGEventFlags flags = CGEventGetFlags(event);
 
-    UniChar ch = 0;
-    if (type == kCGEventKeyDown) {
-        UniChar chars[4];
-        UniCharCount len = 0;
-        CGEventKeyboardGetUnicodeString(event, 4, &len, chars);
-        if (len > 0) ch = chars[0];
+    // Drop autorepeat events for F18 (our remapped Caps Lock). Holding the
+    // key down would otherwise trigger a clipboard probe storm. We still
+    // suppress the event so downstream apps don't see a stream of F18
+    // keystrokes either. Other keys keep autorepeat working as normal.
+    int64_t autorepeat = CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat);
+    if (autorepeat && keycode == F18_VIRTUAL_KEYCODE) {
+        return NULL;
     }
-    // For kCGEventFlagsChanged there is no Unicode payload — keep ch = 0.
 
-    int suppress = goKeyCallback((int64_t)type, (int64_t)keycode, ch, (int64_t)flags);
+    UniChar ch = 0;
+    UniChar chars[4];
+    UniCharCount len = 0;
+    CGEventKeyboardGetUnicodeString(event, 4, &len, chars);
+    if (len > 0) ch = chars[0];
+
+    int suppress = goKeyCallback((int64_t)keycode, ch, (int64_t)flags);
     if (suppress) return NULL;
     return event;
 }
@@ -51,7 +61,11 @@ static void promptAccessibility(void) {
 }
 
 static CFMachPortRef createTap(void) {
-    CGEventMask mask = (1 << kCGEventKeyDown) | (1 << kCGEventFlagsChanged);
+    // Caps Lock arrives as F18 (a normal key-down event) after the hidutil
+    // remap — we no longer need the kCGEventFlagsChanged branch. Reverting
+    // the mask to keyDown-only also keeps the tap from waking up for every
+    // Shift/Cmd/Option transition.
+    CGEventMask mask = (1 << kCGEventKeyDown);
     CFMachPortRef tap = CGEventTapCreate(
         kCGSessionEventTap,
         kCGHeadInsertEventTap,
@@ -74,34 +88,35 @@ import (
 )
 
 const (
-	kCGEventFlagMaskCommand        = 1 << 20
-	kCGEventTypeKeyDown      int64 = 10
-	kCGEventTypeFlagsChanged int64 = 12
-	capsLockKeyCode          uint16 = 0x39
-	// NX_ALPHASHIFTMASK / kCGEventFlagMaskAlphaShift — set when Caps Lock is "on".
-	capsLockMask int64 = 1 << 16
-	// Combined real-modifier bits (shift|control|alt|command). Used to reject
-	// e.g. Cmd+CapsLock so OS-level CapsLock+modifier shortcuts still pass.
-	anyModifierMask int64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)
+	kCGEventFlagMaskCommand = 1 << 20
+	// f18KeyCode is the macOS virtual keycode for F18. Caps Lock is remapped
+	// to F18 at HID level by `remapCapsLockToF18` in main.go, so the event
+	// tap receives normal key-down events with this keycode whenever the
+	// physical Caps Lock key is pressed.
+	f18KeyCode uint16 = 0x4F // 79
+	// anyRealModifierMask combines the bits set when Shift, Control, Option
+	// (Alt), or Command is held. Used to gate the F18 hotkey so that
+	// e.g. Cmd+CapsLock (now Cmd+F18) passes through to the system instead
+	// of triggering our converter.
+	anyRealModifierMask int64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)
 )
 
-// onKeyEvent is set by main() — called synchronously from CGEventTap callback.
-// Returns true to suppress the event. eventType is the CGEventType (10 for
-// key down, 12 for flags changed); flagschanged events carry no character
-// payload (char == 0).
-var onKeyEvent func(eventType int64, keycode uint16, char rune, flags int64) bool
+// onKeyEvent is set by main() — called synchronously from CGEventTap
+// callback. Returns true to suppress the event. The C-side callback only
+// dispatches kCGEventKeyDown, so this is always invoked for a real
+// key-down (autorepeat F18 events are filtered upstream in C).
+var onKeyEvent func(keycode uint16, char rune, flags int64) bool
 
 //export goKeyCallback
-func goKeyCallback(eventType C.int64_t, keycode C.int64_t, character C.UniChar, flags C.int64_t) C.int {
-	// Bail out early during our own paste/type sequences so Caps Lock (and any
-	// other event) issued by the OS in response to our synthesised input does
-	// not re-enter the handler.
+func goKeyCallback(keycode C.int64_t, character C.UniChar, flags C.int64_t) C.int {
+	// Bail out early during our own paste/type sequences so synthetic events
+	// issued by the OS in response to our input do not re-enter the handler.
 	if atomic.LoadInt32(&replacing) == 1 {
 		return 0
 	}
 
 	if onKeyEvent != nil {
-		if onKeyEvent(int64(eventType), uint16(keycode), rune(character), int64(flags)) {
+		if onKeyEvent(uint16(keycode), rune(character), int64(flags)) {
 			return 1 // suppress
 		}
 	}

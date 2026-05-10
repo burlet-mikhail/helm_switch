@@ -1,13 +1,19 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -25,6 +31,259 @@ const (
 	macEnter     = 0x4C // numpad enter
 	macZ         = 0x06 // Z key (still used by the Cmd+Z undo handler)
 )
+
+// USB HID usage codes used by `hidutil property --set`.
+const (
+	hidUsageCapsLock uint64 = 0x700000039
+	hidUsageF18      uint64 = 0x70000006D
+)
+
+// hidutil lifecycle state. We remember the user's pre-existing
+// `UserKeyMapping` so shutdown can restore it verbatim. `capsLockRemapped`
+// is an int32 (not bool) so atomic CAS can guarantee `restoreCapsLock` runs
+// at most once even when called concurrently from multiple shutdown paths
+// (`defer` on main, the signal-handler goroutine, the tray-quit goroutine,
+// and the fatal-error fast path before `log.Fatalf`). Without atomic CAS
+// `go test -race` would flag this — and a double `hidutil --set` would race
+// with the user's other key mappings.
+//
+// `originalUserKeyMapping` is only mutated inside `remapCapsLockToF18` —
+// which runs once on the main goroutine before any other goroutine is
+// spawned — and only read inside `restoreCapsLock`. After the CAS in
+// `restoreCapsLock` claims exclusivity, this read is safe.
+var (
+	originalUserKeyMapping []map[string]uint64
+	capsLockRemapped       int32 // 0 = no remap installed, 1 = installed
+)
+
+// isCapsLockSrc returns true when v is the HID usage code for Caps Lock.
+func isCapsLockSrc(v uint64) bool { return v == hidUsageCapsLock }
+
+// parseHidutilUserKeyMapping parses the property-list-style output produced
+// by `hidutil property --get "UserKeyMapping"`. Each entry is a dictionary
+// block containing two integer fields, `HIDKeyboardModifierMappingSrc` and
+// `HIDKeyboardModifierMappingDst`. macOS prints these in either decimal
+// (e.g., `30064771129`) or hex (`0x700000039`) depending on the macOS
+// version, so both forms are accepted (see `parseHidutilNumber`).
+//
+// The function is forgiving — individually malformed blocks are skipped
+// rather than aborting the whole parse. If parsing returns zero entries
+// from non-empty output the caller refuses to install the remap so a
+// future format change does not cause shutdown to wipe the user's mapping.
+func parseHidutilUserKeyMapping(output string) []map[string]uint64 {
+	// Capture group accepts both `0x...` (case-insensitive) hex and plain
+	// decimal forms. macOS variants of hidutil print one or the other
+	// depending on the platform/version.
+	srcRe := regexp.MustCompile(`HIDKeyboardModifierMappingSrc\s*=\s*(0[xX][0-9a-fA-F]+|\d+)`)
+	dstRe := regexp.MustCompile(`HIDKeyboardModifierMappingDst\s*=\s*(0[xX][0-9a-fA-F]+|\d+)`)
+
+	// Split on '}' so each block contains at most one Src/Dst pair.
+	blocks := strings.Split(output, "}")
+	var entries []map[string]uint64
+	for _, b := range blocks {
+		sm := srcRe.FindStringSubmatch(b)
+		dm := dstRe.FindStringSubmatch(b)
+		if sm == nil || dm == nil {
+			continue
+		}
+		src, err1 := parseHidutilNumber(sm[1])
+		dst, err2 := parseHidutilNumber(dm[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		entries = append(entries, map[string]uint64{
+			"HIDKeyboardModifierMappingSrc": src,
+			"HIDKeyboardModifierMappingDst": dst,
+		})
+	}
+	return entries
+}
+
+// parseHidutilNumber turns `"30064771129"` or `"0x700000039"` into a uint64.
+// Explicit base selection avoids `ParseUint(_, 0, _)`'s "leading 0 →
+// octal" surprise, which would silently mis-parse a future hidutil
+// formatting change.
+func parseHidutilNumber(s string) (uint64, error) {
+	if len(s) > 2 && (s[:2] == "0x" || s[:2] == "0X") {
+		return strconv.ParseUint(s[2:], 16, 64)
+	}
+	return strconv.ParseUint(s, 10, 64)
+}
+
+// looksLikeEmptyHidutilList returns true when `output` is one of the known
+// "no entries" shapes that `hidutil property --get UserKeyMapping` can
+// emit: `()`, `(\n)`, `(null)`, or any of these wrapped in arbitrary
+// whitespace. Used to distinguish a legitimate empty list from an output
+// shape we failed to parse (which should disable the remap rather than
+// risk wiping the user's mapping).
+func looksLikeEmptyHidutilList(output string) bool {
+	t := strings.TrimSpace(output)
+	if t == "" {
+		return true
+	}
+	// Strip a single outer "(" / ")" wrapper plus any whitespace inside.
+	if strings.HasPrefix(t, "(") && strings.HasSuffix(t, ")") {
+		inner := strings.TrimSpace(t[1 : len(t)-1])
+		if inner == "" || strings.EqualFold(inner, "null") {
+			return true
+		}
+	}
+	return false
+}
+
+// encodeUserKeyMappingPayload builds the JSON payload that `hidutil property
+// --set` expects. Each map is emitted with integer values so hidutil
+// interprets them as numbers.
+func encodeUserKeyMappingPayload(entries []map[string]uint64) (string, error) {
+	if entries == nil {
+		entries = []map[string]uint64{}
+	}
+	payload := map[string]interface{}{
+		"UserKeyMapping": entries,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// remapCapsLockToF18 installs an HID-level remap from Caps Lock (USB HID
+// usage 0x700000039) to F18 (0x70000006D). Pre-existing entries in the
+// system's `UserKeyMapping` are preserved — we read them first, drop any
+// stale Caps Lock entry, append our own, and write the merged list back.
+//
+// Returns nil and logs a warning when `hidutil` is not on PATH so the rest
+// of the app keeps running. Returns the underlying error only on a real
+// invocation failure (e.g., permission denied).
+func remapCapsLockToF18() error {
+	if _, err := exec.LookPath("hidutil"); err != nil {
+		log.Printf("WARN [hidutil] not found on PATH (%v) — Caps Lock hotkey disabled", err)
+		return nil
+	}
+
+	// Step 1: read the existing UserKeyMapping so we can merge instead of clobber.
+	// We compute the snapshot in a local first and only commit it to package
+	// state once `--set` succeeds — that way a failed install leaves
+	// `originalUserKeyMapping` untouched (and `restoreCapsLock` is a no-op).
+	getCmd := exec.Command("hidutil", "property", "--get", "UserKeyMapping")
+	getOut, getErr := getCmd.Output()
+
+	var snapshot []map[string]uint64
+	switch {
+	case getErr != nil:
+		// `hidutil` is on PATH but the get call failed (e.g., the property
+		// hasn't been set yet). Fall back to "no prior mapping" — `snapshot`
+		// stays nil and we still attempt the install below.
+		var notFound *exec.Error
+		if errors.As(getErr, &notFound) {
+			log.Printf("WARN [hidutil] not runnable (%v) — Caps Lock hotkey disabled", getErr)
+			return nil
+		}
+		log.Printf("WARN [hidutil] --get UserKeyMapping failed: %v (treating as empty)", getErr)
+	default:
+		snapshot = parseHidutilUserKeyMapping(string(getOut))
+		// Guard against a parser breakage on a future macOS version
+		// silently dropping the user's mapping at restore time. If we
+		// extracted zero entries from output that clearly isn't an empty
+		// list, refuse to install the remap — otherwise shutdown would
+		// wipe the user's UserKeyMapping clean. We treat as "empty" the
+		// known shapes printed by macOS variants: `()`, `(\n)`, with any
+		// surrounding whitespace, plus `(null)`.
+		if len(snapshot) == 0 && !looksLikeEmptyHidutilList(string(getOut)) {
+			log.Printf("WARN [hidutil] could not parse any UserKeyMapping entries from output (%q); "+
+				"refusing to install remap so we don't clobber user mappings on shutdown",
+				strings.TrimSpace(string(getOut)))
+			return nil
+		}
+		vlog("[hidutil] read existing UserKeyMapping: %d entr(y|ies)", len(snapshot))
+	}
+
+	// Step 2: build the merged list. Drop any pre-existing Caps Lock entry
+	// (we'll override it) and append ours.
+	merged := make([]map[string]uint64, 0, len(snapshot)+1)
+	for _, e := range snapshot {
+		if isCapsLockSrc(e["HIDKeyboardModifierMappingSrc"]) {
+			continue
+		}
+		merged = append(merged, e)
+	}
+	merged = append(merged, map[string]uint64{
+		"HIDKeyboardModifierMappingSrc": hidUsageCapsLock,
+		"HIDKeyboardModifierMappingDst": hidUsageF18,
+	})
+
+	payload, err := encodeUserKeyMappingPayload(merged)
+	if err != nil {
+		return fmt.Errorf("[hidutil] encode payload: %w", err)
+	}
+
+	// Step 3: install the remap.
+	setCmd := exec.Command("hidutil", "property", "--set", payload)
+	if out, err := setCmd.CombinedOutput(); err != nil {
+		log.Printf("WARN [hidutil] remap failed: %v (output: %s)", err, strings.TrimSpace(string(out)))
+		return err
+	}
+
+	// Commit the snapshot to package state ONLY now that `--set` succeeded.
+	// Atomic store of `capsLockRemapped` makes the `restoreCapsLock` CAS
+	// happen-before-correct: any goroutine that observes `capsLockRemapped
+	// == 1` is guaranteed to also see the assignment to
+	// `originalUserKeyMapping` made on this line.
+	originalUserKeyMapping = snapshot
+	atomic.StoreInt32(&capsLockRemapped, 1)
+	vlog("[hidutil] CapsLock → F18 remap installed; merged payload: %s", payload)
+	log.Printf("[hidutil] Caps Lock remapped to F18. To reset manually run: "+
+		"hidutil property --set '{\"UserKeyMapping\":[]}' (or restore: %s)",
+		describeMappingForLog(originalUserKeyMapping))
+	return nil
+}
+
+// describeMappingForLog renders the saved mapping in a human-readable shape
+// for the startup log so a user can recover manually after a crash.
+func describeMappingForLog(entries []map[string]uint64) string {
+	if len(entries) == 0 {
+		return "no prior entries"
+	}
+	parts := make([]string, 0, len(entries))
+	for _, e := range entries {
+		parts = append(parts, fmt.Sprintf("0x%x→0x%x",
+			e["HIDKeyboardModifierMappingSrc"], e["HIDKeyboardModifierMappingDst"]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// restoreCapsLock undoes the remap installed by remapCapsLockToF18. Safe
+// to call concurrently from any combination of: the `defer` in `main`,
+// the SIGINT/SIGTERM handler goroutine, the tray-Quit Cocoa callback, and
+// the fatal-error fast path before `log.Fatalf`. The atomic CAS makes the
+// hidutil `--set` run at most once even under contention.
+//
+// If the user had pre-existing entries, those are written back verbatim.
+// If they had none, we clear the list. Logs but never panics — runs from
+// shutdown paths where panicking would be catastrophic.
+func restoreCapsLock() {
+	// Claim exclusivity: only the first caller proceeds; subsequent calls
+	// are no-ops. This pairs with `atomic.StoreInt32(&capsLockRemapped, 1)`
+	// in remapCapsLockToF18, so a successful CAS here is also guaranteed
+	// to see the originalUserKeyMapping assignment from that function.
+	if !atomic.CompareAndSwapInt32(&capsLockRemapped, 1, 0) {
+		return
+	}
+
+	payload, err := encodeUserKeyMappingPayload(originalUserKeyMapping)
+	if err != nil {
+		log.Printf("WARN [hidutil] restore: encode payload failed: %v", err)
+		return
+	}
+
+	cmd := exec.Command("hidutil", "property", "--set", payload)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("WARN [hidutil] restore failed: %v (output: %s)", err, strings.TrimSpace(string(out)))
+		return
+	}
+	vlog("[hidutil] CapsLock mapping restored: %s", payload)
+}
 
 // lastReplace stores the last replacement for undo
 type undoState struct {
@@ -457,32 +716,21 @@ func main() {
 	})
 
 	// Set up key event handler — called synchronously from CGEventTap.
-	// eventType is the CGEventType: kCGEventTypeKeyDown for normal keystrokes
-	// and kCGEventTypeFlagsChanged for modifier transitions (including Caps
-	// Lock, which on macOS arrives as a flags-changed event with no Unicode
-	// payload).
-	onKeyEvent = func(eventType int64, keycode uint16, char rune, flags int64) bool {
-		// Caps Lock is the single hardcoded conversion hotkey. It arrives as
-		// kCGEventFlagsChanged with keycode 0x39, and macOS emits exactly one
-		// such event per physical press (no auto-repeat), so this naturally
-		// fires once per press. The branch is checked BEFORE the cfg.Enabled
-		// / auto-convert gate so the manual hotkey works even when auto-
-		// convert is off and even in excluded apps.
-		if eventType == kCGEventTypeFlagsChanged {
-			if keycode == capsLockKeyCode &&
-				(flags & ^capsLockMask & anyModifierMask) == 0 {
-				// Plain Caps Lock — no other real modifier (Shift/Ctrl/Alt/Cmd)
-				// is held. We mask out the Caps Lock bit itself before checking
-				// for "any modifier" because the AlphaShift bit toggles on
-				// every press regardless of whether the LED is lighting up or
-				// switching off.
-				go handleCapsLock(buf, detector)
-				return true // suppress so the OS doesn't toggle the layout/case state
-			}
-			// Any other flags-changed event (Shift/Cmd/Option pressed alone,
-			// or Caps Lock combined with another modifier we want to leave
-			// alone) — pass through.
-			return false
+	// Caps Lock is remapped to F18 at HID level by `remapCapsLockToF18`, so
+	// the event tap sees it as a normal kCGEventKeyDown with virtual keycode
+	// 0x4F. Autorepeat F18 events are filtered in the C-side hook before
+	// reaching us; the `flags == 0` guard below makes Cmd+CapsLock,
+	// Shift+CapsLock, etc. pass through to the OS unchanged.
+	onKeyEvent = func(keycode uint16, char rune, flags int64) bool {
+		// Caps Lock (remapped to F18) is the single hardcoded conversion
+		// hotkey. Checked BEFORE the cfg.Enabled / auto-convert gate so the
+		// manual hotkey works even when auto-convert is off and even in
+		// excluded apps. `flags & anyRealModifierMask` ensures Cmd+CapsLock
+		// and friends pass through to the system normally.
+		if keycode == f18KeyCode && (flags&anyRealModifierMask) == 0 {
+			vlog("[hook] F18 keyDown received, flags=0x%x", flags)
+			go handleCapsLock(buf, detector)
+			return true // suppress so no other app sees F18
 		}
 
 		if !cfg.Enabled || !isAutoConvertEnabled() {
@@ -634,9 +882,21 @@ func main() {
 		return false
 	}
 
+	// Install the HID-level Caps Lock → F18 remap before starting the hook.
+	// Failures are non-fatal: the app still runs, the F18 path simply never
+	// fires. `defer` covers the normal-return shutdown path; the signal
+	// handler below covers Ctrl+C / SIGTERM (os.Exit skips defers).
+	if err := remapCapsLockToF18(); err != nil {
+		log.Printf("[hidutil] continuing without Caps Lock remap: %v", err)
+	}
+	defer restoreCapsLock()
+
 	// Start keyboard hook
 	err = startHook()
 	if err != nil {
+		// log.Fatalf calls os.Exit, which skips deferred functions —
+		// restore the Caps Lock mapping explicitly before bailing.
+		restoreCapsLock()
 		log.Fatalf("Hook error: %v", err)
 	}
 	log.Println("Keyboard hook started")
@@ -654,12 +914,16 @@ func main() {
 
 	log.Println("RuSwitch ready")
 
-	// Handle signals in background
+	// Handle signals in background. os.Exit skips deferred functions, so we
+	// MUST call restoreCapsLock here explicitly — otherwise Ctrl+C leaves
+	// the user's Caps Lock remapped to F18 until reboot. restoreCapsLock is
+	// idempotent so the deferred call in the normal-return path is harmless.
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
-		log.Println("Shutting down")
+		s := <-sig
+		log.Printf("Shutting down (signal=%v) — restoring Caps Lock", s)
+		restoreCapsLock()
 		os.Exit(0)
 	}()
 

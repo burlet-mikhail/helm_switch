@@ -62,6 +62,10 @@ func goAutoConvertToggle() {
 //export goTrayQuit
 func goTrayQuit() {
 	log.Println("Quit from tray")
+	// os.Exit skips deferred functions, so restore Caps Lock explicitly
+	// here. restoreCapsLock is idempotent — safe even if the signal handler
+	// or main() defer has already run.
+	restoreCapsLock()
 	C.removeTray()
 	os.Exit(0)
 }
