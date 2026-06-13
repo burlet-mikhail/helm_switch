@@ -1,0 +1,37 @@
+--- main.go	2026-06-01 15:06:04.000000000 +0200
++++ main.go	2026-06-01 15:06:04.000000000 +0200
+@@ -509,14 +509,11 @@
+-		// If in a search app (Raycast/Spotlight), an inline prediction might be highlighted.
+-		// If we send Backspace, it deletes the highlight, throwing off our backspace count.
+-		// Typing a comma (',') replaces any highlighted text with a single comma.
+-		// Then we just add 1 to our deleteCount to delete the comma too!
+-		if app == "com.raycast.macos" || app == "com.apple.Spotlight" || app == "com.runningwithcrayons.Alfred" {
+-			sendChar(',')
+-			time.Sleep(15 * time.Millisecond)
+-			deleteCount++
+-		}
++		// Defeat macOS inline autocomplete (Spotlight, System Preferences, Safari).
++		// When text is highlighted (prediction), the first Backspace deletes the highlight.
++		// By typing a comma, we force macOS to replace the prediction with a single comma.
++		// Then we add 1 to our deleteCount to delete that comma.
++		sendChar(',')
++		time.Sleep(15 * time.Millisecond)
++		deleteCount++
+ 
+ 		for i := 0; i < deleteCount; i++ {
+ 			sendBackspaceKey()
+@@ -826,11 +823,8 @@
+ 
+ 					deleteCount := len([]rune(word))
+-					app := FrontmostAppID()
+-					if app == "com.raycast.macos" || app == "com.apple.Spotlight" || app == "com.runningwithcrayons.Alfred" {
+-						sendChar(',')
+-						time.Sleep(15 * time.Millisecond)
+-						deleteCount++
+-					}
++					// Defeat macOS inline autocomplete unconditionally.
++					sendChar(',')
++					time.Sleep(15 * time.Millisecond)
++					deleteCount++
+ 
+ 					for i := 0; i < deleteCount; i++ {

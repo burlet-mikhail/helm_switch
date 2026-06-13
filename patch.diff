@@ -1,0 +1,39 @@
+--- main.go	2026-06-01 14:45:27.000000000 +0200
++++ main.go	2026-06-01 14:45:27.000000000 +0200
+@@ -504,17 +504,20 @@
+-		// If in a search app (Raycast/Spotlight), clear any highlighted autocomplete prediction 
+-		// by sending a Forward Delete. Otherwise, the first backspace deletes the prediction 
+-		// instead of the typed character!
+-		app := FrontmostAppID()
+-		if app == "com.raycast.macos" || app == "com.apple.Spotlight" || app == "com.runningwithcrayons.Alfred" {
+-			sendForwardDeleteKey()
+-			time.Sleep(15 * time.Millisecond)
+-		}
+-
+-		// Give apps time to finish processing the last keystroke before Caps Lock
+-		time.Sleep(50 * time.Millisecond)
+-
+-		deleteCount := len([]rune(current))
+-		if isFlushed {
+-			deleteCount++ // delete the trailing space too
+-		}
++		// If in a search app (Raycast/Spotlight), an inline prediction might be highlighted.
++		// If we send Backspace, it deletes the highlight, throwing off our backspace count.
++		// Typing a comma (',') replaces any highlighted text with a single comma.
++		// Then we just add 1 to our deleteCount to delete the comma too!
++		app := FrontmostAppID()
++		if app == "com.raycast.macos" || app == "com.apple.Spotlight" || app == "com.runningwithcrayons.Alfred" {
++			sendChar(',')
++			time.Sleep(15 * time.Millisecond)
++		}
++
++		// Give apps time to finish processing the last keystroke before Caps Lock
++		time.Sleep(50 * time.Millisecond)
++
++		deleteCount := len([]rune(current))
++		if isFlushed {
++			deleteCount++ // delete the trailing space too
++		}
++		if app == "com.raycast.macos" || app == "com.apple.Spotlight" || app == "com.runningwithcrayons.Alfred" {
++			deleteCount++ // delete the comma we just added
++		}

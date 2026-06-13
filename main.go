@@ -501,15 +501,27 @@ func convertLastWordFromBuffer(buf *Buffer) {
 		atomic.StoreInt32(&replacing, 1)
 		buf.Clear()
 
+		app := FrontmostAppID()
+		isSearchApp := (app == "com.apple.systempreferences" || app == "com.apple.Spotlight" || app == "com.raycast.macos" || app == "com.runningwithcrayons.Alfred")
+
 		deleteCount := len([]rune(current))
 		if isFlushed {
 			deleteCount++ // delete the trailing space too
 		}
+
+		if isSearchApp {
+			// Defeat macOS inline autocomplete by just sending a massive amount of backspaces!
+			// This guarantees we delete the highlight AND the word.
+			deleteCount += 5
+		}
+
+		// Delete old text
+		// In C, sendBackspaceKey already takes 15ms (usleep). We just add 5ms here.
 		for i := 0; i < deleteCount; i++ {
 			sendBackspaceKey()
 			time.Sleep(5 * time.Millisecond)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 		for _, ch := range converted {
 			sendChar(ch)
 			time.Sleep(5 * time.Millisecond)
@@ -706,6 +718,7 @@ func main() {
 
 		// Skip replacement in excluded apps (e.g. IDEs, terminals).
 		app := FrontmostAppID()
+			log.Printf("FrontmostAppID=%q", app)
 		if cfg.IsAppExcluded(app) {
 			return
 		}
@@ -789,6 +802,7 @@ func main() {
 					return false
 				}
 				app := FrontmostAppID()
+			log.Printf("FrontmostAppID=%q", app)
 				if cfg.IsAppExcluded(app) {
 					return false
 				}
@@ -807,12 +821,19 @@ func main() {
 					atomic.StoreInt32(&replacing, 1)
 					buf.Clear()
 
-					wordRunes := []rune(word)
-					for i := 0; i < len(wordRunes); i++ {
+					app := FrontmostAppID()
+					isSearchApp := (app == "com.apple.systempreferences" || app == "com.apple.Spotlight" || app == "com.raycast.macos" || app == "com.runningwithcrayons.Alfred")
+
+					deleteCount := len([]rune(word))
+					if isSearchApp {
+						deleteCount += 5
+					}
+
+					for i := 0; i < deleteCount; i++ {
 						sendBackspaceKey()
 						time.Sleep(5 * time.Millisecond)
 					}
-					time.Sleep(10 * time.Millisecond)
+					time.Sleep(20 * time.Millisecond)
 
 					newText := corrected
 					for _, ch := range corrected {
@@ -852,6 +873,7 @@ func main() {
 				}
 				if store != nil {
 					app := FrontmostAppID()
+			log.Printf("FrontmostAppID=%q", app)
 					if err := store.Add(app, original); err == nil {
 						log.Printf("Learned exception (Cmd+Z): %q in %q", original, app)
 					}

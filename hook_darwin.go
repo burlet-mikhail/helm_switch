@@ -14,7 +14,9 @@ package main
 // Only fires for kCGEventKeyDown — Caps Lock is delivered as F18 (keycode
 // 0x4F) thanks to the hidutil remap installed at startup, so we no longer
 // need the flags-changed path that previously listened for Caps Lock.
+// extern int goKeyCallback(int64_t keycode, UniChar character, int64_t flags);
 extern int goKeyCallback(int64_t keycode, UniChar character, int64_t flags);
+extern void goMouseCallback();
 
 // f18VirtualKeyCode mirrors `f18KeyCode` on the Go side — kept inline here
 // so the C autorepeat-skip branch doesn't need to call into Go.
@@ -23,6 +25,11 @@ extern int goKeyCallback(int64_t keycode, UniChar character, int64_t flags);
 static CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
         CGEventTapEnable((CFMachPortRef)refcon, true);
+        return event;
+    }
+
+    if (type == kCGEventLeftMouseDown) {
+        goMouseCallback();
         return event;
     }
 
@@ -65,7 +72,7 @@ static CFMachPortRef createTap(void) {
     // remap — we no longer need the kCGEventFlagsChanged branch. Reverting
     // the mask to keyDown-only also keeps the tap from waking up for every
     // Shift/Cmd/Option transition.
-    CGEventMask mask = (1 << kCGEventKeyDown);
+    CGEventMask mask = (1 << kCGEventKeyDown) | (1 << kCGEventLeftMouseDown);
     CFMachPortRef tap = CGEventTapCreate(
         kCGSessionEventTap,
         kCGHeadInsertEventTap,
@@ -107,6 +114,10 @@ const (
 // key-down (autorepeat F18 events are filtered upstream in C).
 var onKeyEvent func(keycode uint16, char rune, flags int64) bool
 
+// onMouseEvent is set by main() — called synchronously from CGEventTap
+// on left mouse down.
+var onMouseEvent func()
+
 //export goKeyCallback
 func goKeyCallback(keycode C.int64_t, character C.UniChar, flags C.int64_t) C.int {
 	// Bail out early during our own paste/type sequences so synthetic events
@@ -121,6 +132,13 @@ func goKeyCallback(keycode C.int64_t, character C.UniChar, flags C.int64_t) C.in
 		}
 	}
 	return 0
+}
+
+//export goMouseCallback
+func goMouseCallback() {
+	if onMouseEvent != nil {
+		onMouseEvent()
+	}
 }
 
 func startHook() error {

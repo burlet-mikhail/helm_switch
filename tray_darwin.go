@@ -57,6 +57,13 @@ func goAutoConvertToggle() {
 		C.updateAutoConvertMenu(1)
 		log.Println("Auto-convert: enabled")
 	}
+
+	if cfg, err := LoadConfig(); err == nil {
+		cfg.AutoConvert = (atomic.LoadInt32(&autoConvertEnabled) == 1)
+		if err := SaveConfig(cfg); err != nil {
+			log.Printf("Failed to save config: %v", err)
+		}
+	}
 }
 
 //export goTrayQuit

@@ -35,6 +35,7 @@ static void sendCmdC(void) {
     CGEventRef up = CGEventCreateKeyboardEvent(NULL, 0x08, false);
     CGEventSetFlags(up, kCGEventFlagMaskCommand);
     CGEventPost(kCGHIDEventTap, down);
+    usleep(15000);
     CGEventPost(kCGHIDEventTap, up);
     CFRelease(down);
     CFRelease(up);
@@ -47,6 +48,7 @@ static void sendCmdV(void) {
     CGEventRef up = CGEventCreateKeyboardEvent(NULL, 0x09, false);
     CGEventSetFlags(up, kCGEventFlagMaskCommand);
     CGEventPost(kCGHIDEventTap, down);
+    usleep(15000);
     CGEventPost(kCGHIDEventTap, up);
     CFRelease(down);
     CFRelease(up);
@@ -62,6 +64,44 @@ void sendBackspace(void) {
     CGEventSetFlags(down, 0);
     CGEventSetFlags(up, 0);
     CGEventPost(kCGHIDEventTap, down);
+    usleep(15000);
+    CGEventPost(kCGHIDEventTap, up);
+    CFRelease(down);
+    CFRelease(up);
+}
+
+void sendCmdBackspace(void) {
+    CGEventRef cmdDown = CGEventCreateKeyboardEvent(NULL, 0x37, true);
+    CGEventPost(kCGHIDEventTap, cmdDown);
+    usleep(15000);
+    
+    CGEventRef bsDown = CGEventCreateKeyboardEvent(NULL, 0x33, true);
+    CGEventSetFlags(bsDown, kCGEventFlagMaskCommand);
+    CGEventPost(kCGHIDEventTap, bsDown);
+    usleep(15000);
+    
+    CGEventRef bsUp = CGEventCreateKeyboardEvent(NULL, 0x33, false);
+    CGEventSetFlags(bsUp, kCGEventFlagMaskCommand);
+    CGEventPost(kCGHIDEventTap, bsUp);
+    usleep(15000);
+    
+    CGEventRef cmdUp = CGEventCreateKeyboardEvent(NULL, 0x37, false);
+    CGEventPost(kCGHIDEventTap, cmdUp);
+    usleep(15000);
+    
+    CFRelease(cmdDown);
+    CFRelease(bsDown);
+    CFRelease(bsUp);
+    CFRelease(cmdUp);
+}
+
+void sendOptionBackspace(void) {
+    CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0x33, true);
+    CGEventRef up   = CGEventCreateKeyboardEvent(NULL, 0x33, false);
+    CGEventSetFlags(down, kCGEventFlagMaskAlternate);
+    CGEventSetFlags(up, kCGEventFlagMaskAlternate);
+    CGEventPost(kCGHIDEventTap, down);
+    usleep(15000);
     CGEventPost(kCGHIDEventTap, up);
     CFRelease(down);
     CFRelease(up);
@@ -91,6 +131,7 @@ void sendEnter(void) {
     CGEventSetFlags(down, 0);
     CGEventSetFlags(up, 0);
     CGEventPost(kCGHIDEventTap, down);
+    usleep(15000);
     CGEventPost(kCGHIDEventTap, up);
     CFRelease(down);
     CFRelease(up);
@@ -106,6 +147,7 @@ void sendUnichar(UniChar ch) {
     CGEventKeyboardSetUnicodeString(down, 1, c);
     CGEventKeyboardSetUnicodeString(up, 1, c);
     CGEventPost(kCGHIDEventTap, down);
+    usleep(15000);
     CGEventPost(kCGHIDEventTap, up);
     CFRelease(down);
     CFRelease(up);
@@ -193,6 +235,8 @@ func IsRussianLayout() bool {
 
 // Go wrappers for C functions — used by main.go for Enter handling
 func sendBackspaceKey() { C.sendBackspace() }
+func sendOptionBackspace() { C.sendOptionBackspace() }
+func sendCmdBackspace() { C.sendCmdBackspace() }
 func sendChar(ch rune)  { C.sendUnichar(C.UniChar(ch)) }
 func switchLang()       { C.switchLayout() }
 func sendEnter()        { C.sendEnter() }
@@ -224,12 +268,23 @@ func replaceText(buf *Buffer, deleteChars int, newText string) {
 	vlog("REPLACE START: delete=%d text=%q", deleteChars, newText)
 	buf.Clear()
 
-	// Delete old text (word + boundary char)
-	for i := 0; i < deleteChars; i++ {
-		C.sendBackspace()
-		time.Sleep(5 * time.Millisecond)
+	// Give OS time to process the space/boundary before sending backspaces
+	time.Sleep(50 * time.Millisecond)
+
+	app := FrontmostAppID()
+	isSearchApp := (app == "com.apple.systempreferences" || app == "com.apple.Spotlight" || app == "com.raycast.macos" || app == "com.runningwithcrayons.Alfred")
+
+	if isSearchApp {
+		C.sendOptionBackspace()
+		time.Sleep(50 * time.Millisecond)
+	} else {
+		// Delete old text (word + boundary char)
+		for i := 0; i < deleteChars; i++ {
+			C.sendBackspace()
+			time.Sleep(15 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	time.Sleep(10 * time.Millisecond)
 
 	// Type corrected text + space
 	for _, ch := range newText {
