@@ -327,6 +327,11 @@ type lastWordState struct {
 
 var lastWord lastWordState
 
+// capsHandling is a single-flight guard for handleCapsLock: 1 while a Caps Lock
+// conversion is in progress, 0 otherwise. Prevents overlapping presses from
+// interleaving keystroke synthesis.
+var capsHandling int32
+
 // Set records a fresh conversion and arms the toggle-back window.
 func (l *lastWordState) Set(original, converted string) {
 	l.mu.Lock()
@@ -389,6 +394,51 @@ func looksLikeContext(word string) bool {
 	return false
 }
 
+// containsCyrillic reports whether s holds at least one Cyrillic letter. Used
+// as the direction heuristic for conversions: any Cyrillic → the text was typed
+// in QWERTY while RU was active, so convert RU→QWERTY; otherwise QWERTY→RU.
+func containsCyrillic(s string) bool {
+	for _, r := range s {
+		if (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я') || r == 'ё' || r == 'Ё' {
+			return true
+		}
+	}
+	return false
+}
+
+// convertByHeuristic converts s in whichever direction containsCyrillic implies.
+func convertByHeuristic(s string) string {
+	if containsCyrillic(s) {
+		return RussianToQWERTY(s)
+	}
+	return QWERTYToRussian(s)
+}
+
+// searchAppBundleIDs are apps whose text fields show inline autocomplete that
+// must be defeated with extra backspaces during a last-word conversion.
+var searchAppBundleIDs = map[string]bool{
+	"com.apple.systempreferences":   true,
+	"com.apple.Spotlight":           true,
+	"com.raycast.macos":             true,
+	"com.runningwithcrayons.Alfred": true,
+}
+
+// isSearchApp reports whether app is one of the inline-autocomplete search apps.
+func isSearchApp(app string) bool { return searchAppBundleIDs[app] }
+
+// isNavigationKey reports whether keycode is an arrow / Home / End / Page key.
+// These move the caret or extend a selection, so the typing buffer no longer
+// reflects what is at the cursor and must be invalidated.
+func isNavigationKey(keycode uint16) bool {
+	switch keycode {
+	case 0x7B, 0x7C, 0x7D, 0x7E, // ← → ↓ ↑
+		0x73, 0x77, // Home, End
+		0x74, 0x79: // Page Up, Page Down
+		return true
+	}
+	return false
+}
+
 // finishSelectionConvert: convert an already-copied selection and paste it
 // back. Caller is responsible for: saving the original clipboard, raising the
 // `replacing` flag, sending Cmd+C, and reading `selected` from the clipboard.
@@ -399,37 +449,37 @@ func looksLikeContext(word string) bool {
 // already sends to detect "selection vs. no selection" instead of double-
 // copying.
 func finishSelectionConvert(detector *Detector, savedClipboard, selected string) {
-	// Convert the entire selection in whichever direction fits.
-	// Heuristic: if it contains Cyrillic letters, convert RU→QWERTY; else QWERTY→RU.
-	var converted string
-	hasCyrillic := false
-	for _, r := range selected {
-		if r >= 'а' && r <= 'я' || r >= 'А' && r <= 'Я' || r == 'ё' || r == 'Ё' {
-			hasCyrillic = true
-			break
-		}
-	}
-	if hasCyrillic {
-		converted = RussianToQWERTY(selected)
-	} else {
-		converted = QWERTYToRussian(selected)
+	// Always release the replacing flag, no matter which path we take out.
+	defer atomic.StoreInt32(&replacing, 0)
+
+	converted := convertByHeuristic(selected)
+	if converted == selected {
+		// Nothing to do (e.g. selection had no convertible characters). Leave
+		// the user's selection and clipboard untouched.
+		log.Printf("Manual convert: %q unchanged, skipping", selected)
+		return
 	}
 
 	// Put converted text into clipboard and paste it over the selection.
 	writeClipboard(converted)
 	time.Sleep(30 * time.Millisecond)
 	sendPaste()
-	time.Sleep(150 * time.Millisecond)
 
-	// Restore original clipboard so we don't pollute the user's copy/paste state.
-	if savedClipboard != "" {
-		writeClipboard(savedClipboard)
-	}
+	// Wait long enough for the frontmost app to actually consume the paste
+	// before we touch the clipboard again. Restoring too early is a race that
+	// makes the app paste the OLD clipboard contents instead of `converted`
+	// (observed as "garbage pasted at the start"). 200ms is comfortably above
+	// the paste-processing latency of every app tested.
+	time.Sleep(200 * time.Millisecond)
+
+	// Restore original clipboard so we don't pollute the user's copy/paste
+	// state. When the clipboard was empty before, clear it back to empty rather
+	// than leaving `converted` behind.
+	writeClipboard(savedClipboard)
 
 	// Switch system layout too — user intent is obvious.
 	switchLang()
 	time.Sleep(30 * time.Millisecond)
-	atomic.StoreInt32(&replacing, 0)
 
 	log.Printf("Manual convert: %q → %q", selected, converted)
 }
@@ -440,33 +490,33 @@ func finishSelectionConvert(detector *Detector, savedClipboard, selected string)
 // the toggle-back window so a subsequent Caps Lock press without intervening
 // real keystrokes reverts the conversion.
 //
-// Called from handleCapsLock when no selection was detected.
+// Called from handleCapsLock when no selection was detected. Runs synchronously
+// on handleCapsLock's goroutine (off the event-tap thread), so the caller's
+// single-flight guard covers the whole operation.
 func convertLastWordFromBuffer(buf *Buffer) {
 	origPrev, convPrev, active := lastWord.Snapshot()
 	current := buf.LastWord()
 
 	if active {
 		// Toggle-back path: revert convPrev → origPrev.
-		go func() {
-			atomic.StoreInt32(&replacing, 1)
-			buf.Clear()
-			for range convPrev {
-				sendBackspaceKey()
-				time.Sleep(5 * time.Millisecond)
-			}
-			time.Sleep(10 * time.Millisecond)
-			for _, ch := range origPrev {
-				sendChar(ch)
-				time.Sleep(5 * time.Millisecond)
-			}
-			switchLang()
-			time.Sleep(30 * time.Millisecond)
-			// Toggling back ends the toggle window — a subsequent press must
-			// re-convert from the buffer, not bounce.
-			lastWord.Reset()
-			atomic.StoreInt32(&replacing, 0)
-			log.Printf("convert_last_word: revert %q → %q", convPrev, origPrev)
-		}()
+		atomic.StoreInt32(&replacing, 1)
+		buf.Clear()
+		for range convPrev {
+			sendBackspaceKey()
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(10 * time.Millisecond)
+		for _, ch := range origPrev {
+			sendChar(ch)
+			time.Sleep(5 * time.Millisecond)
+		}
+		switchLang()
+		time.Sleep(30 * time.Millisecond)
+		// Toggling back ends the toggle window — a subsequent press must
+		// re-convert from the buffer, not bounce.
+		lastWord.Reset()
+		atomic.StoreInt32(&replacing, 0)
+		log.Printf("convert_last_word: revert %q → %q", convPrev, origPrev)
 		return
 	}
 
@@ -481,64 +531,46 @@ func convertLastWordFromBuffer(buf *Buffer) {
 	// delete that trailing space too.
 	isFlushed := buf.IsBufferEmpty()
 
-	// Direction heuristic mirrors finishSelectionConvert: any Cyrillic → assume
-	// RU was typed in QWERTY layout, convert RU→QWERTY; otherwise QWERTY→RU.
-	hasCyrillic := false
-	for _, r := range current {
-		if (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я') || r == 'ё' || r == 'Ё' {
-			hasCyrillic = true
-			break
-		}
-	}
-	var converted string
-	if hasCyrillic {
-		converted = RussianToQWERTY(current)
-	} else {
-		converted = QWERTYToRussian(current)
+	// Direction heuristic mirrors finishSelectionConvert.
+	converted := convertByHeuristic(current)
+
+	atomic.StoreInt32(&replacing, 1)
+	buf.Clear()
+
+	deleteCount := len([]rune(current))
+	if isFlushed {
+		deleteCount++ // delete the trailing space too
 	}
 
-	go func() {
-		atomic.StoreInt32(&replacing, 1)
-		buf.Clear()
+	if isSearchApp(FrontmostAppID()) {
+		// Defeat macOS inline autocomplete by just sending a massive amount of backspaces!
+		// This guarantees we delete the highlight AND the word.
+		deleteCount += 5
+	}
 
-		app := FrontmostAppID()
-		isSearchApp := (app == "com.apple.systempreferences" || app == "com.apple.Spotlight" || app == "com.raycast.macos" || app == "com.runningwithcrayons.Alfred")
-
-		deleteCount := len([]rune(current))
-		if isFlushed {
-			deleteCount++ // delete the trailing space too
-		}
-
-		if isSearchApp {
-			// Defeat macOS inline autocomplete by just sending a massive amount of backspaces!
-			// This guarantees we delete the highlight AND the word.
-			deleteCount += 5
-		}
-
-		// Delete old text
-		// In C, sendBackspaceKey already takes 15ms (usleep). We just add 5ms here.
-		for i := 0; i < deleteCount; i++ {
-			sendBackspaceKey()
-			time.Sleep(5 * time.Millisecond)
-		}
-		time.Sleep(20 * time.Millisecond)
-		for _, ch := range converted {
-			sendChar(ch)
-			time.Sleep(5 * time.Millisecond)
-		}
-		if isFlushed {
-			// Re-type the space we deleted
-			sendChar(' ')
-			time.Sleep(5 * time.Millisecond)
-		}
-		switchLang()
-		time.Sleep(30 * time.Millisecond)
-		// Arm the toggle window. The next Caps Lock press (with no real
-		// keystroke in between) will revert this.
-		lastWord.Set(current, converted)
-		atomic.StoreInt32(&replacing, 0)
-		log.Printf("convert_last_word: %q → %q (flushed=%v)", current, converted, isFlushed)
-	}()
+	// Delete old text
+	// In C, sendBackspaceKey already takes 15ms (usleep). We just add 5ms here.
+	for i := 0; i < deleteCount; i++ {
+		sendBackspaceKey()
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	for _, ch := range converted {
+		sendChar(ch)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if isFlushed {
+		// Re-type the space we deleted
+		sendChar(' ')
+		time.Sleep(5 * time.Millisecond)
+	}
+	switchLang()
+	time.Sleep(30 * time.Millisecond)
+	// Arm the toggle window. The next Caps Lock press (with no real
+	// keystroke in between) will revert this.
+	lastWord.Set(current, converted)
+	atomic.StoreInt32(&replacing, 0)
+	log.Printf("convert_last_word: %q → %q (flushed=%v)", current, converted, isFlushed)
 }
 
 // handleCapsLock is the single Caps Lock entry point. Priority order:
@@ -558,6 +590,16 @@ func convertLastWordFromBuffer(buf *Buffer) {
 // Runs in its own goroutine (spawned from onKeyEvent) because it involves
 // keystroke synthesis and clipboard I/O that must not block the event tap.
 func handleCapsLock(buf *Buffer, detector *Detector) {
+	// Single-flight: a press while a previous conversion is still running would
+	// interleave keystroke synthesis and corrupt both. Drop the overlapping
+	// press instead. (The C-side autorepeat filter already drops held-key
+	// repeats; this guards genuine rapid double-presses.)
+	if !atomic.CompareAndSwapInt32(&capsHandling, 0, 1) {
+		vlog("[caps] handler already running, dropping press")
+		return
+	}
+	defer atomic.StoreInt32(&capsHandling, 0)
+
 	// Fast path 1: toggle-back is armed — always last-word path.
 	_, _, toggleActive := lastWord.Snapshot()
 	if toggleActive {
@@ -565,37 +607,62 @@ func handleCapsLock(buf *Buffer, detector *Detector) {
 		return
 	}
 
-	// Fast path 2: user is mid-word (actively typing). A text selection
-	// can't coexist with an active caret in the same text field, so skip
-	// the clipboard probe.
+	// Fast path 2: user is mid-word (actively typing). The buffer is cleared on
+	// every selection/navigation gesture (mouse down, arrows, Cmd shortcuts —
+	// see onKeyEvent/onMouseEvent), so a non-empty buffer reliably means the
+	// caret is at the end of freshly typed text with no selection. Convert the
+	// last word directly and skip the clipboard probe.
 	if !buf.IsBufferEmpty() {
 		convertLastWordFromBuffer(buf)
 		return
 	}
 
-	// Slow path: buffer is empty (user finished typing, or moved cursor/
-	// selected text). Probe for a selection via Cmd+C → clipboard diff.
-	savedClipboard := readClipboard()
-
+	// Slow path: buffer is empty — the user finished typing, moved the cursor,
+	// or selected text (mouse / Cmd+A / Shift+arrows). Probe for a selection.
 	atomic.StoreInt32(&replacing, 1)
-	sendCopy()
-	time.Sleep(100 * time.Millisecond)
-
-	selected := readClipboard()
-
-	if selected != "" && selected != savedClipboard {
-		// Selection found — convert it.
+	selected, savedClipboard, found := probeSelection()
+	if found {
+		// finishSelectionConvert releases the replacing flag.
 		finishSelectionConvert(detector, savedClipboard, selected)
 		return
 	}
 
-	// No selection found. Restore clipboard, then fall back to converting
-	// the last flushed word (if any).
+	// No selection found. The probe left the clipboard untouched (changeCount
+	// did not advance), so there is nothing to restore. Fall back to converting
+	// the last flushed word, if any.
 	atomic.StoreInt32(&replacing, 0)
-	if savedClipboard != "" {
-		writeClipboard(savedClipboard)
-	}
 	convertLastWordFromBuffer(buf)
+}
+
+// probeSelection sends a synthetic Cmd+C and reports the currently selected
+// text. It detects a real copy by diffing the pasteboard changeCount rather
+// than comparing strings, so a selection identical to the existing clipboard is
+// still recognised. The caller must have raised the `replacing` flag so the
+// synthetic copy does not re-enter the event handler.
+//
+// Returns the selected text, the clipboard contents to restore afterwards, and
+// whether a selection was found. When no selection is found the clipboard is
+// guaranteed untouched (no restore needed).
+func probeSelection() (selected, savedClipboard string, found bool) {
+	savedClipboard = readClipboard()
+	before := clipboardChangeCount()
+
+	sendCopy()
+
+	// Apps write the pasteboard asynchronously after Cmd+C. Poll the
+	// changeCount until it advances, up to ~250ms, instead of a single fixed
+	// sleep that races slow apps.
+	for i := 0; i < 25; i++ {
+		time.Sleep(10 * time.Millisecond)
+		if clipboardChangeCount() != before {
+			selected = readClipboard()
+			if selected != "" {
+				return selected, savedClipboard, true
+			}
+			break
+		}
+	}
+	return "", savedClipboard, false
 }
 
 func main() {
@@ -784,6 +851,18 @@ func main() {
 			return false
 		}
 
+		// Navigation / selection gestures (arrows, Home/End, Page Up/Down) move
+		// the caret or extend a selection, so the typing buffer no longer
+		// reflects what is at the cursor. Invalidate it (and the toggle window)
+		// so handleCapsLock falls through to the selection probe instead of
+		// converting a stale last word. Also keeps arrow-key function chars out
+		// of the buffer.
+		if isNavigationKey(keycode) {
+			buf.Clear()
+			lastWord.Reset()
+			return false
+		}
+
 		// Skip null chars and modifier-only events
 		if char == 0 || char == 0x08 {
 			return false
@@ -821,11 +900,8 @@ func main() {
 					atomic.StoreInt32(&replacing, 1)
 					buf.Clear()
 
-					app := FrontmostAppID()
-					isSearchApp := (app == "com.apple.systempreferences" || app == "com.apple.Spotlight" || app == "com.raycast.macos" || app == "com.runningwithcrayons.Alfred")
-
 					deleteCount := len([]rune(word))
-					if isSearchApp {
+					if isSearchApp(FrontmostAppID()) {
 						deleteCount += 5
 					}
 
@@ -897,7 +973,14 @@ func main() {
 				}()
 				return true
 			}
-			// All other Cmd+key combos: pass through without touching buffer.
+			// All other Cmd+key combos (Cmd+A select-all, Cmd+←/→ navigation,
+			// Cmd+C/V, …) change the selection or caret position. The typing
+			// buffer is no longer a reliable picture of what is at the cursor,
+			// so invalidate it — this is what lets a Caps Lock press after
+			// Cmd+A probe and convert the whole selection instead of the last
+			// typed word. Pass the shortcut through to the app untouched.
+			buf.Clear()
+			lastWord.Reset()
 			return false
 		}
 
@@ -919,6 +1002,16 @@ func main() {
 		}
 
 		return false
+	}
+
+	// A mouse click repositions the caret or starts a new selection, so the
+	// typing buffer (and the toggle window) no longer reflect the cursor. Clear
+	// them so a Caps Lock press after a click-selection probes for the real
+	// selection instead of converting a stale last word. Wired here because the
+	// C event tap already reports left-mouse-down via goMouseCallback.
+	onMouseEvent = func() {
+		buf.Clear()
+		lastWord.Reset()
 	}
 
 	// Install the HID-level Caps Lock → F18 remap before starting the hook.

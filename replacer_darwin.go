@@ -28,6 +28,15 @@ static void writeClipboardString(const char* utf8) {
     [pb setString:s forType:NSPasteboardTypeString];
 }
 
+// clipboardChangeCount returns the pasteboard's changeCount, which increments
+// on every write (including the OS-side write performed by a real copy). Diffing
+// it across a synthetic Cmd+C is the canonical way to detect whether a copy
+// actually happened — unlike string comparison, it correctly reports a copy
+// even when the selected text is identical to the previous clipboard contents.
+static long clipboardChangeCount(void) {
+    return (long)[[NSPasteboard generalPasteboard] changeCount];
+}
+
 // sendCmdC sends Cmd+C (copy)
 static void sendCmdC(void) {
     CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0x08, true);
@@ -260,6 +269,10 @@ func writeClipboard(s string) {
 func sendCopy()  { C.sendCmdC() }
 func sendPaste() { C.sendCmdV() }
 
+// clipboardChangeCount returns the pasteboard's monotonically increasing change
+// counter. Used by the selection probe to detect a real copy reliably.
+func clipboardChangeCount() int64 { return int64(C.clipboardChangeCount()) }
+
 func replaceText(buf *Buffer, deleteChars int, newText string) {
 	if !atomic.CompareAndSwapInt32(&replacing, 0, 1) {
 		vlog("REPLACE SKIPPED (already replacing): %q", newText)
@@ -271,10 +284,7 @@ func replaceText(buf *Buffer, deleteChars int, newText string) {
 	// Give OS time to process the space/boundary before sending backspaces
 	time.Sleep(50 * time.Millisecond)
 
-	app := FrontmostAppID()
-	isSearchApp := (app == "com.apple.systempreferences" || app == "com.apple.Spotlight" || app == "com.raycast.macos" || app == "com.runningwithcrayons.Alfred")
-
-	if isSearchApp {
+	if isSearchApp(FrontmostAppID()) {
 		C.sendOptionBackspace()
 		time.Sleep(50 * time.Millisecond)
 	} else {
