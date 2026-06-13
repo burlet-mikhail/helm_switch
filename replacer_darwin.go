@@ -4,11 +4,12 @@ package main
 
 /*
 #cgo CFLAGS: -x objective-c
-#cgo LDFLAGS: -framework CoreGraphics -framework CoreFoundation -framework Carbon -framework AppKit
+#cgo LDFLAGS: -framework CoreGraphics -framework CoreFoundation -framework Carbon -framework AppKit -framework ApplicationServices
 
 #include <CoreGraphics/CoreGraphics.h>
 #include <Carbon/Carbon.h>
 #include <AppKit/AppKit.h>
+#include <ApplicationServices/ApplicationServices.h>
 #include <dispatch/dispatch.h>
 
 // readClipboardString returns a strdup'd UTF-8 string from the clipboard, or NULL.
@@ -35,6 +36,89 @@ static void writeClipboardString(const char* utf8) {
 // even when the selected text is identical to the previous clipboard contents.
 static long clipboardChangeCount(void) {
     return (long)[[NSPasteboard generalPasteboard] changeCount];
+}
+
+// --- Accessibility (AX) selection helpers ---------------------------------
+
+// axCopyFocusedElement returns the focused UI element, or NULL. Caller releases.
+static AXUIElementRef axCopyFocusedElement(void) {
+    AXUIElementRef sys = AXUIElementCreateSystemWide();
+    if (!sys) return NULL;
+    CFTypeRef focused = NULL;
+    AXError e = AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute, &focused);
+    CFRelease(sys);
+    if (e != kAXErrorSuccess || !focused) return NULL;
+    return (AXUIElementRef)focused;
+}
+
+// axSelectedText returns a malloc'd UTF-8 copy of the focused element's selected
+// text, or NULL when there is no selection / AX is unavailable. Caller frees.
+static char* axSelectedText(void) {
+    AXUIElementRef el = axCopyFocusedElement();
+    if (!el) return NULL;
+    CFTypeRef sel = NULL;
+    AXError e = AXUIElementCopyAttributeValue(el, kAXSelectedTextAttribute, &sel);
+    CFRelease(el);
+    if (e != kAXErrorSuccess || !sel) return NULL;
+    if (CFGetTypeID(sel) != CFStringGetTypeID()) { CFRelease(sel); return NULL; }
+    CFStringRef s = (CFStringRef)sel;
+    CFIndex len = CFStringGetLength(s);
+    if (len == 0) { CFRelease(sel); return NULL; }
+    CFIndex maxBytes = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+    char* buf = (char*)malloc(maxBytes);
+    if (!buf) { CFRelease(sel); return NULL; }
+    Boolean ok = CFStringGetCString(s, buf, maxBytes, kCFStringEncodingUTF8);
+    CFRelease(sel);
+    if (!ok) { free(buf); return NULL; }
+    return buf;
+}
+
+// axSelectionLength returns the length of the focused element's selected text
+// range: 0 = no selection, >0 = selection of that many characters, -1 = AX
+// cannot provide it (app unsupported). This works in more apps than reading the
+// selected string, so it's used to decide whether a selection EXISTS before we
+// risk an Option+Shift+Left that would otherwise shrink an existing selection.
+static long axSelectionLength(void) {
+    AXUIElementRef el = axCopyFocusedElement();
+    if (!el) return -1;
+    CFTypeRef val = NULL;
+    AXError e = AXUIElementCopyAttributeValue(el, kAXSelectedTextRangeAttribute, &val);
+    CFRelease(el);
+    if (e != kAXErrorSuccess || !val) return -1;
+    if (CFGetTypeID(val) != AXValueGetTypeID()) { CFRelease(val); return -1; }
+    CFRange r = {0, 0};
+    Boolean ok = AXValueGetValue((AXValueRef)val, kAXValueCFRangeType, &r);
+    CFRelease(val);
+    if (!ok) return -1;
+    return (long)r.length;
+}
+
+// axSetSelectedText replaces the focused element's selected text with utf8 via
+// the Accessibility API — no clipboard, no synthetic keys. Returns 1 on success.
+static int axSetSelectedText(const char* utf8) {
+    AXUIElementRef el = axCopyFocusedElement();
+    if (!el) return 0;
+    CFStringRef s = CFStringCreateWithCString(NULL, utf8, kCFStringEncodingUTF8);
+    if (!s) { CFRelease(el); return 0; }
+    AXError e = AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute, s);
+    CFRelease(s);
+    CFRelease(el);
+    return (e == kAXErrorSuccess) ? 1 : 0;
+}
+
+// sendOptionShiftLeft selects the word to the left of the caret
+// (Option+Shift+Left = "select previous word" on macOS).
+static void sendOptionShiftLeft(void) {
+    CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0x7B, true);
+    CGEventRef up   = CGEventCreateKeyboardEvent(NULL, 0x7B, false);
+    CGEventFlags f = kCGEventFlagMaskAlternate | kCGEventFlagMaskShift;
+    CGEventSetFlags(down, f);
+    CGEventSetFlags(up, f);
+    CGEventPost(kCGHIDEventTap, down);
+    usleep(15000);
+    CGEventPost(kCGHIDEventTap, up);
+    CFRelease(down);
+    CFRelease(up);
 }
 
 // sendCmdC sends Cmd+C (copy)
@@ -272,6 +356,34 @@ func sendPaste() { C.sendCmdV() }
 // clipboardChangeCount returns the pasteboard's monotonically increasing change
 // counter. Used by the selection probe to detect a real copy reliably.
 func clipboardChangeCount() int64 { return int64(C.clipboardChangeCount()) }
+
+// axSelectedText returns the focused element's selected text via the
+// Accessibility API, or "" if there is no selection or AX is unavailable.
+func axSelectedText() string {
+	cstr := C.axSelectedText()
+	if cstr == nil {
+		return ""
+	}
+	defer C.free(unsafe.Pointer(cstr))
+	return C.GoString(cstr)
+}
+
+// axSelectionLength reports the length of the current selection: 0 = none,
+// >0 = a selection of that many characters, -1 = AX cannot tell (app
+// unsupported). Used to decide whether a selection already exists.
+func axSelectionLength() int64 { return int64(C.axSelectionLength()) }
+
+// axSetSelectedText replaces the focused element's selected text via the
+// Accessibility API (no clipboard, no keystrokes). Returns false if the app
+// does not support AX text mutation.
+func axSetSelectedText(s string) bool {
+	cs := C.CString(s)
+	defer C.free(unsafe.Pointer(cs))
+	return C.axSetSelectedText(cs) == 1
+}
+
+// sendOptionShiftLeft selects the word immediately left of the caret.
+func sendOptionShiftLeft() { C.sendOptionShiftLeft() }
 
 func replaceText(buf *Buffer, deleteChars int, newText string) {
 	if !atomic.CompareAndSwapInt32(&replacing, 0, 1) {

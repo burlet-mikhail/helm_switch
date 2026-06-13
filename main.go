@@ -314,50 +314,14 @@ func (u *undoState) Get() (original, replaced string, ok bool) {
 	return orig, repl, true
 }
 
-// lastWordState tracks the most recent convert_last_word conversion so a
-// repeated press of the hotkey can toggle back to the original word. The
-// toggle window is invalidated by any non-modifier real keystroke (regular
-// chars and backspace) — see Task 10 callsites in onKeyEvent.
-type lastWordState struct {
-	mu        sync.Mutex
-	original  string // word as the user typed it (pre-conversion)
-	converted string // what we typed instead
-	active    bool   // true if the next hotkey press should toggle back
-}
-
-var lastWord lastWordState
-
 // capsHandling is a single-flight guard for handleCapsLock: 1 while a Caps Lock
 // conversion is in progress, 0 otherwise. Prevents overlapping presses from
 // interleaving keystroke synthesis.
+//
+// Note: the manual hotkey no longer keeps a "toggle-back" state machine. Layout
+// conversion is a bijection, so pressing Caps Lock again simply re-converts the
+// word at the caret straight back to the original — the revert is automatic.
 var capsHandling int32
-
-// Set records a fresh conversion and arms the toggle-back window.
-func (l *lastWordState) Set(original, converted string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.original = original
-	l.converted = converted
-	l.active = true
-}
-
-// Reset clears the toggle-back window. Called by the toggle-back path after
-// reverting and by any real keystroke handler that signals "buffer changed".
-func (l *lastWordState) Reset() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.original = ""
-	l.converted = ""
-	l.active = false
-}
-
-// Snapshot returns the current state under the mutex so callers can act on a
-// consistent view without holding the lock during long operations.
-func (l *lastWordState) Snapshot() (original, converted string, active bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.original, l.converted, l.active
-}
 
 // looksLikeContext returns true if the word looks like a URL, email, file path,
 // or identifier that should NOT be auto-converted. Heuristics are conservative —
@@ -439,230 +403,145 @@ func isNavigationKey(keycode uint16) bool {
 	return false
 }
 
-// finishSelectionConvert: convert an already-copied selection and paste it
-// back. Caller is responsible for: saving the original clipboard, raising the
-// `replacing` flag, sending Cmd+C, and reading `selected` from the clipboard.
-// This function takes over from "we know what's selected" and runs the
-// convert + paste + restore-clipboard + switchLang + clear-replacing tail.
+// handleCapsLock is the single Caps Lock entry point. It reads what is ACTUALLY
+// at the cursor via the Accessibility API instead of trusting the keystroke
+// buffer, so it behaves correctly even after the user clicks, moves the caret,
+// or selects with the mouse:
 //
-// Splitting the flow this way lets handleCapsLock reuse the single Cmd+C it
-// already sends to detect "selection vs. no selection" instead of double-
-// copying.
-func finishSelectionConvert(detector *Detector, savedClipboard, selected string) {
-	// Always release the replacing flag, no matter which path we take out.
-	defer atomic.StoreInt32(&replacing, 0)
-
-	converted := convertByHeuristic(selected)
-	if converted == selected {
-		// Nothing to do (e.g. selection had no convertible characters). Leave
-		// the user's selection and clipboard untouched.
-		log.Printf("Manual convert: %q unchanged, skipping", selected)
-		return
-	}
-
-	// Put converted text into clipboard and paste it over the selection.
-	writeClipboard(converted)
-	time.Sleep(30 * time.Millisecond)
-	sendPaste()
-
-	// Wait long enough for the frontmost app to actually consume the paste
-	// before we touch the clipboard again. Restoring too early is a race that
-	// makes the app paste the OLD clipboard contents instead of `converted`
-	// (observed as "garbage pasted at the start"). 200ms is comfortably above
-	// the paste-processing latency of every app tested.
-	time.Sleep(200 * time.Millisecond)
-
-	// Restore original clipboard so we don't pollute the user's copy/paste
-	// state. When the clipboard was empty before, clear it back to empty rather
-	// than leaving `converted` behind.
-	writeClipboard(savedClipboard)
-
-	// Switch system layout too — user intent is obvious.
-	switchLang()
-	time.Sleep(30 * time.Millisecond)
-
-	log.Printf("Manual convert: %q → %q", selected, converted)
-}
-
-// convertLastWordFromBuffer reads the last typed word from buf (which may be
-// either the in-progress word or the last flushed word if a space/boundary
-// was already typed) and replaces it with the layout-converted version. Arms
-// the toggle-back window so a subsequent Caps Lock press without intervening
-// real keystrokes reverts the conversion.
+//  1. If there is a real selection (read via AX) → convert it in place.
+//  2. Otherwise select the word left of the caret (Option+Shift+Left), read the
+//     real selected text, and convert that.
 //
-// Called from handleCapsLock when no selection was detected. Runs synchronously
-// on handleCapsLock's goroutine (off the event-tap thread), so the caller's
-// single-flight guard covers the whole operation.
-func convertLastWordFromBuffer(buf *Buffer) {
-	origPrev, convPrev, active := lastWord.Snapshot()
-	current := buf.LastWord()
-
-	if active {
-		// Toggle-back path: revert convPrev → origPrev.
-		atomic.StoreInt32(&replacing, 1)
-		buf.Clear()
-		for range convPrev {
-			sendBackspaceKey()
-			time.Sleep(5 * time.Millisecond)
-		}
-		time.Sleep(10 * time.Millisecond)
-		for _, ch := range origPrev {
-			sendChar(ch)
-			time.Sleep(5 * time.Millisecond)
-		}
-		switchLang()
-		time.Sleep(30 * time.Millisecond)
-		// Toggling back ends the toggle window — a subsequent press must
-		// re-convert from the buffer, not bounce.
-		lastWord.Reset()
-		atomic.StoreInt32(&replacing, 0)
-		log.Printf("convert_last_word: revert %q → %q", convPrev, origPrev)
-		return
-	}
-
-	// Fresh-convert path.
-	if current == "" {
-		log.Printf("convert_last_word: empty buffer, no-op")
-		return
-	}
-
-	// If the current buffer is empty, LastWord() returned the last flushed
-	// word — meaning a space/boundary was already typed after it. We need to
-	// delete that trailing space too.
-	isFlushed := buf.IsBufferEmpty()
-
-	// Direction heuristic mirrors finishSelectionConvert.
-	converted := convertByHeuristic(current)
-
-	atomic.StoreInt32(&replacing, 1)
-	buf.Clear()
-
-	deleteCount := len([]rune(current))
-	if isFlushed {
-		deleteCount++ // delete the trailing space too
-	}
-
-	if isSearchApp(FrontmostAppID()) {
-		// Defeat macOS inline autocomplete by just sending a massive amount of backspaces!
-		// This guarantees we delete the highlight AND the word.
-		deleteCount += 5
-	}
-
-	// Delete old text
-	// In C, sendBackspaceKey already takes 15ms (usleep). We just add 5ms here.
-	for i := 0; i < deleteCount; i++ {
-		sendBackspaceKey()
-		time.Sleep(5 * time.Millisecond)
-	}
-	time.Sleep(20 * time.Millisecond)
-	for _, ch := range converted {
-		sendChar(ch)
-		time.Sleep(5 * time.Millisecond)
-	}
-	if isFlushed {
-		// Re-type the space we deleted
-		sendChar(' ')
-		time.Sleep(5 * time.Millisecond)
-	}
-	switchLang()
-	time.Sleep(30 * time.Millisecond)
-	// Arm the toggle window. The next Caps Lock press (with no real
-	// keystroke in between) will revert this.
-	lastWord.Set(current, converted)
-	atomic.StoreInt32(&replacing, 0)
-	log.Printf("convert_last_word: %q → %q (flushed=%v)", current, converted, isFlushed)
-}
-
-// handleCapsLock is the single Caps Lock entry point. Priority order:
+// Because layout conversion is a bijection, pressing Caps Lock again simply
+// re-converts the word back — no explicit toggle/undo state is needed.
 //
-//  1. If the toggle-back window is armed → revert (last-word path).
-//  2. If the user is mid-word (buffer.chars > 0) → convert last word
-//     directly. No Cmd+C needed because you can't have a selection while
-//     actively typing.
-//  3. Otherwise (buffer empty, user finished typing or is selecting) →
-//     probe for selection via Cmd+C. If found → convert selection.
-//     If not found → fall back to converting the last flushed word.
-//
-// This ordering avoids sending Cmd+C when it's unnecessary (mid-typing),
-// which prevents side effects in apps that react to Cmd+C without a
-// selection (search bars, line-copy in IDEs, etc.).
-//
-// Runs in its own goroutine (spawned from onKeyEvent) because it involves
-// keystroke synthesis and clipboard I/O that must not block the event tap.
-func handleCapsLock(buf *Buffer, detector *Detector) {
+// Runs in its own goroutine (spawned from onKeyEvent) because it synthesises
+// keystrokes and must not block the event tap.
+func handleCapsLock(buf *Buffer) {
 	// Single-flight: a press while a previous conversion is still running would
 	// interleave keystroke synthesis and corrupt both. Drop the overlapping
-	// press instead. (The C-side autorepeat filter already drops held-key
-	// repeats; this guards genuine rapid double-presses.)
+	// press. (The C-side autorepeat filter already drops held-key repeats; this
+	// guards genuine rapid double-presses.)
 	if !atomic.CompareAndSwapInt32(&capsHandling, 0, 1) {
 		vlog("[caps] handler already running, dropping press")
 		return
 	}
 	defer atomic.StoreInt32(&capsHandling, 0)
 
-	// Fast path 1: toggle-back is armed — always last-word path.
-	_, _, toggleActive := lastWord.Snapshot()
-	if toggleActive {
-		convertLastWordFromBuffer(buf)
-		return
-	}
+	// Invoking the manual hotkey rewrites text at the caret, so the typing
+	// buffer no longer matches the document. Clear it so auto-convert-on-space
+	// doesn't later act on a stale word.
+	buf.Clear()
 
-	// Fast path 2: user is mid-word (actively typing). The buffer is cleared on
-	// every selection/navigation gesture (mouse down, arrows, Cmd shortcuts —
-	// see onKeyEvent/onMouseEvent), so a non-empty buffer reliably means the
-	// caret is at the end of freshly typed text with no selection. Convert the
-	// last word directly and skip the clipboard probe.
-	if !buf.IsBufferEmpty() {
-		convertLastWordFromBuffer(buf)
-		return
-	}
-
-	// Slow path: buffer is empty — the user finished typing, moved the cursor,
-	// or selected text (mouse / Cmd+A / Shift+arrows). Probe for a selection.
+	// Suppress the buffer/auto-convert machinery for the whole operation so our
+	// own synthetic keystrokes (Option+Shift+Left, paste) don't re-enter.
 	atomic.StoreInt32(&replacing, 1)
-	selected, savedClipboard, found := probeSelection()
-	if found {
-		// finishSelectionConvert releases the replacing flag.
-		finishSelectionConvert(detector, savedClipboard, selected)
+	defer atomic.StoreInt32(&replacing, 0)
+
+	// --- Step 1: convert an EXISTING selection, if there is one. -------------
+	// We must establish whether a selection exists BEFORE doing any
+	// Option+Shift+Left, because that gesture shrinks an existing selection by a
+	// word instead of selecting a fresh one (the "converted all but the last
+	// word" bug). axSelectionLength tells us reliably even when the app won't
+	// hand us the selected string.
+	selLen := axSelectionLength()
+
+	if sel := axSelectedText(); sel != "" {
+		// Native app exposed the selection directly.
+		convertSelectionInPlace(sel)
 		return
 	}
-
-	// No selection found. The probe left the clipboard untouched (changeCount
-	// did not advance), so there is nothing to restore. Fall back to converting
-	// the last flushed word, if any.
-	atomic.StoreInt32(&replacing, 0)
-	convertLastWordFromBuffer(buf)
-}
-
-// probeSelection sends a synthetic Cmd+C and reports the currently selected
-// text. It detects a real copy by diffing the pasteboard changeCount rather
-// than comparing strings, so a selection identical to the existing clipboard is
-// still recognised. The caller must have raised the `replacing` flag so the
-// synthetic copy does not re-enter the event handler.
-//
-// Returns the selected text, the clipboard contents to restore afterwards, and
-// whether a selection was found. When no selection is found the clipboard is
-// guaranteed untouched (no restore needed).
-func probeSelection() (selected, savedClipboard string, found bool) {
-	savedClipboard = readClipboard()
-	before := clipboardChangeCount()
-
-	sendCopy()
-
-	// Apps write the pasteboard asynchronously after Cmd+C. Poll the
-	// changeCount until it advances, up to ~250ms, instead of a single fixed
-	// sleep that races slow apps.
-	for i := 0; i < 25; i++ {
-		time.Sleep(10 * time.Millisecond)
-		if clipboardChangeCount() != before {
-			selected = readClipboard()
-			if selected != "" {
-				return selected, savedClipboard, true
-			}
-			break
+	if selLen != 0 {
+		// Either AX confirms a selection exists but withheld the string
+		// (selLen > 0), or AX is unavailable for this app (selLen == -1, e.g.
+		// browsers/Electron). Probe the clipboard for the selection. When
+		// selLen > 0 a real selection definitely exists; when selLen == -1 a
+		// non-empty copy means Cmd+A/mouse selected something.
+		if sel := copySelectionViaClipboard(); sel != "" {
+			convertSelectionInPlace(sel)
+			return
 		}
 	}
-	return "", savedClipboard, false
+
+	// --- Step 2: no selection — convert the word left of the caret. ----------
+	// Safe to use Option+Shift+Left now: we've confirmed there is no selection
+	// to disturb. Reading the real selected text (AX, clipboard fallback) keeps
+	// this independent of the typing buffer.
+	sendOptionShiftLeft()
+	time.Sleep(40 * time.Millisecond)
+
+	word := axSelectedText()
+	if word == "" {
+		word = copySelectionViaClipboard()
+	}
+	if strings.TrimSpace(word) == "" {
+		// Nothing convertible at the caret (empty field, leading whitespace,
+		// punctuation). Leave the harmless selection as-is.
+		log.Printf("[caps] no convertible word at caret, no-op")
+		return
+	}
+	convertSelectionInPlace(word)
+}
+
+// convertSelectionInPlace converts `selected` and writes the result back over
+// the current selection. It prefers the Accessibility API (no clipboard, no
+// keystrokes); if the app doesn't support AX mutation it falls back to pasting
+// over the (real) selection, restoring the clipboard afterwards.
+func convertSelectionInPlace(selected string) {
+	converted := convertByHeuristic(selected)
+	if converted == selected {
+		// No convertible characters — don't disturb the user's text/selection.
+		log.Printf("[caps] %q unchanged, skipping", selected)
+		return
+	}
+
+	if axSetSelectedText(converted) {
+		switchLang()
+		time.Sleep(30 * time.Millisecond)
+		log.Printf("[caps] convert (AX): %q → %q", selected, converted)
+		return
+	}
+
+	pasteOverSelection(converted)
+	switchLang()
+	time.Sleep(30 * time.Millisecond)
+	log.Printf("[caps] convert (paste): %q → %q", selected, converted)
+}
+
+// pasteOverSelection replaces the current selection with text via the clipboard,
+// restoring the previous clipboard contents afterwards. Safe only when a real
+// selection exists (otherwise it inserts at the caret).
+func pasteOverSelection(text string) {
+	saved := readClipboard()
+	writeClipboard(text)
+	time.Sleep(30 * time.Millisecond)
+	sendPaste()
+	// Wait for the app to consume the paste before restoring the clipboard;
+	// restoring too early makes the app paste the OLD contents instead.
+	time.Sleep(200 * time.Millisecond)
+	writeClipboard(saved)
+}
+
+// copySelectionViaClipboard copies the current selection (Cmd+C) and returns it,
+// detecting the copy via the pasteboard changeCount and restoring the previous
+// clipboard. Used as an AX-read fallback right after we have created a real
+// selection, so there is no "empty Cmd+C copies the line" false positive.
+func copySelectionViaClipboard() string {
+	saved := readClipboard()
+	before := clipboardChangeCount()
+	sendCopy()
+	// Poll up to ~150ms for the copy to land. Long enough for slow apps to
+	// report a real selection, short enough not to stall when an empty Cmd+C
+	// copies nothing (the no-selection case in non-AX apps).
+	for i := 0; i < 15; i++ {
+		time.Sleep(10 * time.Millisecond)
+		if clipboardChangeCount() != before {
+			selected := readClipboard()
+			writeClipboard(saved) // restore — we only wanted to read
+			return selected
+		}
+	}
+	return ""
 }
 
 func main() {
@@ -721,7 +600,7 @@ func main() {
 		log.SetOutput(logFile)
 	}
 
-	log.Println("RuSwitch starting...")
+	log.Println("Helm Switch starting...")
 
 	// Load config
 	cfg, err := LoadConfig()
@@ -832,18 +711,16 @@ func main() {
 		// and friends pass through to the system normally.
 		if keycode == f18KeyCode && (flags&anyRealModifierMask) == 0 {
 			vlog("[hook] F18 keyDown received, flags=0x%x", flags)
-			go handleCapsLock(buf, detector)
+			go handleCapsLock(buf)
 			return true // suppress so no other app sees F18
 		}
 
-		// --- Buffer accumulation: ALWAYS runs regardless of auto-convert ---
-		// The buffer must track keystrokes even when auto-convert is off so
-		// that the Caps Lock manual conversion (which is gated separately
-		// above) has something to work with.
+		// --- Buffer accumulation feeds the auto-convert-on-boundary feature ---
+		// (The Caps Lock manual hotkey reads the document via Accessibility and
+		// no longer depends on this buffer.)
 
 		// Backspace
 		if keycode == macBackspace {
-			lastWord.Reset()
 			buf.Backspace()
 			if tracker != nil {
 				tracker.ObserveKey(KeyObservation{Kind: KeyKindBackspace})
@@ -851,15 +728,12 @@ func main() {
 			return false
 		}
 
-		// Navigation / selection gestures (arrows, Home/End, Page Up/Down) move
-		// the caret or extend a selection, so the typing buffer no longer
-		// reflects what is at the cursor. Invalidate it (and the toggle window)
-		// so handleCapsLock falls through to the selection probe instead of
-		// converting a stale last word. Also keeps arrow-key function chars out
-		// of the buffer.
+		// Navigation gestures (arrows, Home/End, Page Up/Down) move the caret,
+		// so the typing buffer no longer reflects the word at the cursor.
+		// Invalidate it so auto-convert doesn't fire across a cursor jump. Also
+		// keeps arrow-key function chars out of the buffer.
 		if isNavigationKey(keycode) {
 			buf.Clear()
-			lastWord.Reset()
 			return false
 		}
 
@@ -974,18 +848,15 @@ func main() {
 				return true
 			}
 			// All other Cmd+key combos (Cmd+A select-all, Cmd+←/→ navigation,
-			// Cmd+C/V, …) change the selection or caret position. The typing
-			// buffer is no longer a reliable picture of what is at the cursor,
-			// so invalidate it — this is what lets a Caps Lock press after
-			// Cmd+A probe and convert the whole selection instead of the last
-			// typed word. Pass the shortcut through to the app untouched.
+			// Cmd+C/V, …) change the selection or caret position, so the typing
+			// buffer no longer reflects the word at the cursor. Invalidate it so
+			// auto-convert doesn't fire across the change. Pass the shortcut
+			// through to the app untouched.
 			buf.Clear()
-			lastWord.Reset()
 			return false
 		}
 
 		// Regular char (no Command modifier) — accumulate in buffer.
-		lastWord.Reset()
 		buf.Add(char)
 		if tracker != nil {
 			res := tracker.ObserveKey(KeyObservation{Kind: KeyKindChar, Rune: char})
@@ -1005,13 +876,11 @@ func main() {
 	}
 
 	// A mouse click repositions the caret or starts a new selection, so the
-	// typing buffer (and the toggle window) no longer reflect the cursor. Clear
-	// them so a Caps Lock press after a click-selection probes for the real
-	// selection instead of converting a stale last word. Wired here because the
-	// C event tap already reports left-mouse-down via goMouseCallback.
+	// typing buffer no longer reflects the word at the cursor. Clear it so
+	// auto-convert doesn't fire across the jump. Wired here because the C event
+	// tap already reports left-mouse-down via goMouseCallback.
 	onMouseEvent = func() {
 		buf.Clear()
-		lastWord.Reset()
 	}
 
 	// Install the HID-level Caps Lock → F18 remap before starting the hook.
@@ -1044,7 +913,7 @@ func main() {
 	// (must be called after startTray() initializes NSApplication).
 	installFrontmostObserver()
 
-	log.Println("RuSwitch ready")
+	log.Println("Helm Switch ready")
 
 	// Handle signals in background. os.Exit skips deferred functions, so we
 	// MUST call restoreCapsLock here explicitly — otherwise Ctrl+C leaves

@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>RuSwitch</string>
+    <string>Helm Switch</string>
     <key>CFBundleDisplayName</key>
-    <string>RuSwitch</string>
+    <string>Helm Switch</string>
     <key>CFBundleIdentifier</key>
     <string>com.romankovalev.ruswitch</string>
     <key>CFBundleVersion</key>
@@ -17,7 +17,7 @@
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleExecutable</key>
-    <string>RuSwitch</string>
+    <string>HelmSwitch</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
@@ -25,7 +25,7 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSAccessibilityUsageDescription</key>
-    <string>RuSwitch needs accessibility access to monitor keyboard input and automatically correct text typed in the wrong keyboard layout (Russian/English).</string>
+    <string>Helm Switch needs accessibility access to monitor keyboard input and automatically correct text typed in the wrong keyboard layout (Russian/English).</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSApplicationCategoryType</key>
