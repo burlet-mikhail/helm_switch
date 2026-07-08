@@ -70,7 +70,10 @@ install: app
 	@# Force LaunchServices/Spotlight to pick up the new name and icon.
 	@$(LSREGISTER) -f ~/Applications/"$(APP_NAME)" 2>/dev/null || true
 	@echo "  ✔  ~/Applications/$(APP_NAME)"
-	@echo "  →  Re-grant Accessibility for 'Helm Switch' and launch it."
+	@# Relaunch so the app is actually running after install (and reinstalls the
+	@# Caps Lock -> F18 remap). Without this the hotkey is dead until launched.
+	@open ~/Applications/"$(APP_NAME)"
+	@echo "  →  Launched. If the hotkey does nothing, re-grant Accessibility for 'Helm Switch' (toggle it off/on) and relaunch."
 
 # --------------------------------------------------------------------------
 build-windows:

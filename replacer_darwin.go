@@ -93,24 +93,52 @@ static long axSelectionLength(void) {
     return (long)r.length;
 }
 
-// axSetSelectedText replaces the focused element's selected text with utf8 via
-// the Accessibility API — no clipboard, no synthetic keys. Returns 1 on success.
-static int axSetSelectedText(const char* utf8) {
+// axCopyStringAttribute reads a CFString attribute from the focused element
+// and returns it as a malloc'd UTF-8 buffer (caller frees), or NULL.
+static char* axCopyStringAttribute(CFStringRef attr) {
     AXUIElementRef el = axCopyFocusedElement();
-    if (!el) return 0;
-    CFStringRef s = CFStringCreateWithCString(NULL, utf8, kCFStringEncodingUTF8);
-    if (!s) { CFRelease(el); return 0; }
-    AXError e = AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute, s);
-    CFRelease(s);
+    if (!el) return NULL;
+    CFTypeRef val = NULL;
+    AXError e = AXUIElementCopyAttributeValue(el, attr, &val);
     CFRelease(el);
-    return (e == kAXErrorSuccess) ? 1 : 0;
+    if (e != kAXErrorSuccess || !val) return NULL;
+    if (CFGetTypeID(val) != CFStringGetTypeID()) { CFRelease(val); return NULL; }
+    CFStringRef s = (CFStringRef)val;
+    CFIndex len = CFStringGetLength(s);
+    CFIndex maxBytes = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+    char* buf = (char*)malloc(maxBytes);
+    if (!buf) { CFRelease(val); return NULL; }
+    Boolean ok = CFStringGetCString(s, buf, maxBytes, kCFStringEncodingUTF8);
+    CFRelease(val);
+    if (!ok) { free(buf); return NULL; }
+    return buf;
 }
+
+static char* axRole(void)            { return axCopyStringAttribute(kAXRoleAttribute); }
+static char* axSubrole(void)         { return axCopyStringAttribute(kAXSubroleAttribute); }
+static char* axRoleDescription(void) { return axCopyStringAttribute(kAXRoleDescriptionAttribute); }
+static char* axIdentifier(void)      { return axCopyStringAttribute(CFSTR("AXIdentifier")); }
 
 // sendOptionShiftLeft selects the word to the left of the caret
 // (Option+Shift+Left = "select previous word" on macOS).
 static void sendOptionShiftLeft(void) {
     CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0x7B, true);
     CGEventRef up   = CGEventCreateKeyboardEvent(NULL, 0x7B, false);
+    CGEventFlags f = kCGEventFlagMaskAlternate | kCGEventFlagMaskShift;
+    CGEventSetFlags(down, f);
+    CGEventSetFlags(up, f);
+    CGEventPost(kCGHIDEventTap, down);
+    usleep(15000);
+    CGEventPost(kCGHIDEventTap, up);
+    CFRelease(down);
+    CFRelease(up);
+}
+
+// sendOptionShiftRight shrinks/extends the selection one word to the right
+// (Option+Shift+Right). Used to retract an over-extended token selection.
+static void sendOptionShiftRight(void) {
+    CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0x7C, true);
+    CGEventRef up   = CGEventCreateKeyboardEvent(NULL, 0x7C, false);
     CGEventFlags f = kCGEventFlagMaskAlternate | kCGEventFlagMaskShift;
     CGEventSetFlags(down, f);
     CGEventSetFlags(up, f);
@@ -167,21 +195,21 @@ void sendCmdBackspace(void) {
     CGEventRef cmdDown = CGEventCreateKeyboardEvent(NULL, 0x37, true);
     CGEventPost(kCGHIDEventTap, cmdDown);
     usleep(15000);
-    
+
     CGEventRef bsDown = CGEventCreateKeyboardEvent(NULL, 0x33, true);
     CGEventSetFlags(bsDown, kCGEventFlagMaskCommand);
     CGEventPost(kCGHIDEventTap, bsDown);
     usleep(15000);
-    
+
     CGEventRef bsUp = CGEventCreateKeyboardEvent(NULL, 0x33, false);
     CGEventSetFlags(bsUp, kCGEventFlagMaskCommand);
     CGEventPost(kCGHIDEventTap, bsUp);
     usleep(15000);
-    
+
     CGEventRef cmdUp = CGEventCreateKeyboardEvent(NULL, 0x37, false);
     CGEventPost(kCGHIDEventTap, cmdUp);
     usleep(15000);
-    
+
     CFRelease(cmdDown);
     CFRelease(bsDown);
     CFRelease(bsUp);
@@ -327,12 +355,12 @@ func IsRussianLayout() bool {
 }
 
 // Go wrappers for C functions — used by main.go for Enter handling
-func sendBackspaceKey() { C.sendBackspace() }
+func sendBackspaceKey()    { C.sendBackspace() }
 func sendOptionBackspace() { C.sendOptionBackspace() }
-func sendCmdBackspace() { C.sendCmdBackspace() }
-func sendChar(ch rune)  { C.sendUnichar(C.UniChar(ch)) }
-func switchLang()       { C.switchLayout() }
-func sendEnter()        { C.sendEnter() }
+func sendCmdBackspace()    { C.sendCmdBackspace() }
+func sendChar(ch rune)     { C.sendUnichar(C.UniChar(ch)) }
+func switchLang()          { C.switchLayout() }
+func sendEnter()           { C.sendEnter() }
 
 // Clipboard + paste helpers for the manual-conversion hotkey (Cmd+Shift+X)
 func readClipboard() string {
@@ -368,22 +396,38 @@ func axSelectedText() string {
 	return C.GoString(cstr)
 }
 
+// axFocusedInfo returns role / subrole / role description / identifier of the
+// currently focused UI element, for diagnostics and terminal-panel detection.
+func axFocusedInfo() (role, subrole, desc, id string) {
+	if p := C.axRole(); p != nil {
+		role = C.GoString(p)
+		C.free(unsafe.Pointer(p))
+	}
+	if p := C.axSubrole(); p != nil {
+		subrole = C.GoString(p)
+		C.free(unsafe.Pointer(p))
+	}
+	if p := C.axRoleDescription(); p != nil {
+		desc = C.GoString(p)
+		C.free(unsafe.Pointer(p))
+	}
+	if p := C.axIdentifier(); p != nil {
+		id = C.GoString(p)
+		C.free(unsafe.Pointer(p))
+	}
+	return
+}
+
 // axSelectionLength reports the length of the current selection: 0 = none,
 // >0 = a selection of that many characters, -1 = AX cannot tell (app
 // unsupported). Used to decide whether a selection already exists.
 func axSelectionLength() int64 { return int64(C.axSelectionLength()) }
 
-// axSetSelectedText replaces the focused element's selected text via the
-// Accessibility API (no clipboard, no keystrokes). Returns false if the app
-// does not support AX text mutation.
-func axSetSelectedText(s string) bool {
-	cs := C.CString(s)
-	defer C.free(unsafe.Pointer(cs))
-	return C.axSetSelectedText(cs) == 1
-}
-
 // sendOptionShiftLeft selects the word immediately left of the caret.
 func sendOptionShiftLeft() { C.sendOptionShiftLeft() }
+
+// sendOptionShiftRight retracts/extends the selection one word to the right.
+func sendOptionShiftRight() { C.sendOptionShiftRight() }
 
 func replaceText(buf *Buffer, deleteChars int, newText string) {
 	if !atomic.CompareAndSwapInt32(&replacing, 0, 1) {

@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 func init() {
@@ -428,6 +429,15 @@ func handleCapsLock(buf *Buffer) {
 	}
 	defer atomic.StoreInt32(&capsHandling, 0)
 
+	// Snapshot the typing buffer BEFORE we clear it — the JetBrains terminal
+	// fallback below has no other way to know what the user just typed.
+	// bufferedFlushed is true when the word was already terminated by a
+	// non-punctuation boundary (usually a space), so the caret sits AFTER that
+	// boundary. The terminal fallback needs this to send one extra backspace
+	// and retype the trailing space.
+	bufferedWord := buf.LastWord()
+	bufferedFlushed := buf.IsBufferEmpty()
+
 	// Invoking the manual hotkey rewrites text at the caret, so the typing
 	// buffer no longer matches the document. Clear it so auto-convert-on-space
 	// doesn't later act on a stale word.
@@ -445,35 +455,77 @@ func handleCapsLock(buf *Buffer) {
 	// word" bug). axSelectionLength tells us reliably even when the app won't
 	// hand us the selected string.
 	selLen := axSelectionLength()
+	app := FrontmostAppID()
+	role, subrole, desc, id := axFocusedInfo()
+	log.Printf("[caps] start app=%q selLen=%d role=%q subrole=%q desc=%q id=%q",
+		app, selLen, role, subrole, desc, id)
+
+	// JetBrains IDEs (IntelliJ, PhpStorm, GoLand, …) embed JediTerm as their
+	// terminal panel and expose it through AX as a plain "AXTextArea" — while
+	// their actual code editor and plugin fields use the "JavaAxIgnore" role.
+	// Sending Option+Shift+Left into JediTerm doesn't select a word: the OS
+	// forwards it as ^[[1;4D, which the shell prints as "[D" garbage. Use the
+	// typing buffer instead — what the user just typed is exactly what we want
+	// to convert — and overwrite it by sending backspaces + the corrected text.
+	if strings.HasPrefix(app, "com.jetbrains.") && role == "AXTextArea" {
+		convertLastWordFromBuffer(bufferedWord, bufferedFlushed, "JetBrains terminal panel")
+		return
+	}
 
 	if sel := axSelectedText(); sel != "" {
 		// Native app exposed the selection directly.
+		log.Printf("[caps] AX read direct selection: %q", sel)
 		convertSelectionInPlace(sel)
 		return
 	}
-	if selLen != 0 {
-		// Either AX confirms a selection exists but withheld the string
-		// (selLen > 0), or AX is unavailable for this app (selLen == -1, e.g.
-		// browsers/Electron). Probe the clipboard for the selection. When
-		// selLen > 0 a real selection definitely exists; when selLen == -1 a
-		// non-empty copy means Cmd+A/mouse selected something.
-		if sel := copySelectionViaClipboard(); sel != "" {
+	// Probe the clipboard for an existing selection. We do this even when
+	// selLen == 0 because "JavaAxIgnore" roles (JetBrains plugin fields) hide
+	// selections entirely: selLen reads 0 and axSelectedText is empty even
+	// during a real selection. Falling straight into Step 2's
+	// Option+Shift+Left would then EXTEND the existing selection into the
+	// previous word instead of converting only what the user selected.
+	// changeCount-based copy detection makes this safe: if there's no
+	// selection, Cmd+C changes nothing and we simply move on. Skip it only
+	// when AX is known unavailable (selLen == -1) — the same guard as before.
+	if selLen >= 0 {
+		sel := copySelectionViaClipboard()
+		log.Printf("[caps] clipboard probe (selLen=%d) returned %q", selLen, sel)
+		if sel != "" {
 			convertSelectionInPlace(sel)
 			return
 		}
 	}
 
-	// --- Step 2: no selection — convert the word left of the caret. ----------
-	// Safe to use Option+Shift+Left now: we've confirmed there is no selection
-	// to disturb. Reading the real selected text (AX, clipboard fallback) keeps
-	// this independent of the typing buffer.
-	sendOptionShiftLeft()
-	time.Sleep(40 * time.Millisecond)
-
-	word := axSelectedText()
-	if word == "" {
+	// --- Step 2: no selection — convert the token left of the caret. ---------
+	// Safe to select now: we've confirmed there is no selection to disturb.
+	var word string
+	if selLen == 0 {
+		// AX read works here → grow the selection over the FULL whitespace-
+		// delimited token (so layout punctuation inside a word, e.g. the comma
+		// in "hf,jnfkj", doesn't split it). Convert whatever ends up selected.
+		selectTokenLeftOfCaret()
+		word = axSelectedText()
+		log.Printf("[caps] AX path selected: %q", word)
+		// JetBrains IDEs (IntelliJ, PhpStorm, etc.) expose
+		// kAXSelectedTextRangeAttribute (so selLen reads 0 correctly) but
+		// refuse to return the selected text through kAXSelectedText — even
+		// after we genuinely extend the selection. Fall back to the clipboard,
+		// which DOES see the real selection.
+		if strings.TrimSpace(word) == "" {
+			if clip := copySelectionViaClipboard(); clip != "" {
+				word = clip
+				log.Printf("[caps] AX path empty, clipboard fallback returned: %q", word)
+			}
+		}
+	} else {
+		// No AX read (browser/Electron): fall back to a single word selection.
+		// Layout-punctuation-containing tokens may be only partly converted here.
+		sendOptionShiftLeft()
+		time.Sleep(40 * time.Millisecond)
 		word = copySelectionViaClipboard()
+		log.Printf("[caps] non-AX path (Opt+Shift+Left) selected: %q", word)
 	}
+
 	if strings.TrimSpace(word) == "" {
 		// Nothing convertible at the caret (empty field, leading whitespace,
 		// punctuation). Leave the harmless selection as-is.
@@ -483,10 +535,94 @@ func handleCapsLock(buf *Buffer) {
 	convertSelectionInPlace(word)
 }
 
+// convertLastWordFromBuffer handles the Caps Lock hotkey in apps where
+// selection-via-keystroke is unsafe (e.g. JetBrains' JediTerm terminal panel,
+// where Option+Shift+Left becomes a shell escape sequence). We don't try to
+// read the document — we use the typing buffer the hook has been accumulating.
+// The buffer reflects what the user just typed, so we delete that many
+// characters with backspace and retype the converted text.
+//
+// Caveat: if the user clicked away or moved the caret after typing, the buffer
+// no longer matches what's at the cursor. That's the same trade-off as the
+// auto-convert path and acceptable for a manual hotkey.
+func convertLastWordFromBuffer(word string, hasTrailingSpace bool, reasonForLog string) {
+	if strings.TrimSpace(word) == "" {
+		log.Printf("[caps] %s: empty typing buffer, no-op", reasonForLog)
+		return
+	}
+	converted := convertByHeuristic(word)
+	if converted == word {
+		log.Printf("[caps] %s: %q unchanged, skipping", reasonForLog, word)
+		return
+	}
+
+	backspaces := len([]rune(word))
+	if hasTrailingSpace {
+		// The word was already flushed by a space (or another non-punctuation
+		// boundary), so the caret sits AFTER that boundary char. Eat it too,
+		// then retype it after the converted word so we don't shift the line.
+		backspaces++
+	}
+	for i := 0; i < backspaces; i++ {
+		sendBackspaceKey()
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	for _, ch := range converted {
+		sendChar(ch)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if hasTrailingSpace {
+		sendChar(' ')
+		time.Sleep(5 * time.Millisecond)
+	}
+	switchLang()
+	time.Sleep(30 * time.Millisecond)
+	log.Printf("[caps] %s: %q → %q (trailingSpace=%v)", reasonForLog, word, converted, hasTrailingSpace)
+}
+
+// selectTokenLeftOfCaret grows the selection leftward over a whole
+// whitespace-delimited token, starting from the caret. Plain Option+Shift+Left
+// ("select previous word") stops at punctuation, which splits layout-converted
+// words like "hf,jnfkj" (the comma is б). We keep extending word-by-word while
+// each new chunk is glued to the previous one (no whitespace between them), and
+// stop — retracting one step — as soon as an extension crosses real whitespace.
+//
+// Requires a working AX selected-text read (caller gates on axSelectionLength).
+// Leaves the selection in place for the caller to read and convert.
+func selectTokenLeftOfCaret() {
+	prev := ""
+	for i := 0; i < 16; i++ {
+		sendOptionShiftLeft()
+		time.Sleep(15 * time.Millisecond)
+		sel := axSelectedText()
+		if sel == prev {
+			break // selection stopped growing → reached start of field/line
+		}
+		if prev != "" && strings.HasSuffix(sel, prev) {
+			prefix := sel[:len(sel)-len(prev)]
+			if strings.TrimRightFunc(prefix, unicode.IsSpace) != prefix {
+				// The newly added chunk is separated from the token by
+				// whitespace → we crossed a word boundary. Undo this extension.
+				sendOptionShiftRight()
+				time.Sleep(15 * time.Millisecond)
+				break
+			}
+		}
+		prev = sel
+	}
+}
+
 // convertSelectionInPlace converts `selected` and writes the result back over
-// the current selection. It prefers the Accessibility API (no clipboard, no
-// keystrokes); if the app doesn't support AX mutation it falls back to pasting
-// over the (real) selection, restoring the clipboard afterwards.
+// the current selection by pasting. The caller guarantees a real selection
+// exists (either pre-existing, or just made via Option+Shift+Left), so the
+// paste replaces it rather than inserting.
+//
+// NOTE: we deliberately do NOT use AXUIElementSetAttributeValue(kAXSelectedText)
+// here — many apps (browsers, Electron, some native fields) return success from
+// that call without actually mutating the text, which silently dropped the
+// conversion ("selects but doesn't translate"). Pasting over the selection
+// works uniformly across apps.
 func convertSelectionInPlace(selected string) {
 	converted := convertByHeuristic(selected)
 	if converted == selected {
@@ -495,17 +631,10 @@ func convertSelectionInPlace(selected string) {
 		return
 	}
 
-	if axSetSelectedText(converted) {
-		switchLang()
-		time.Sleep(30 * time.Millisecond)
-		log.Printf("[caps] convert (AX): %q → %q", selected, converted)
-		return
-	}
-
 	pasteOverSelection(converted)
 	switchLang()
 	time.Sleep(30 * time.Millisecond)
-	log.Printf("[caps] convert (paste): %q → %q", selected, converted)
+	log.Printf("[caps] convert: %q → %q", selected, converted)
 }
 
 // pasteOverSelection replaces the current selection with text via the clipboard,
@@ -530,10 +659,10 @@ func copySelectionViaClipboard() string {
 	saved := readClipboard()
 	before := clipboardChangeCount()
 	sendCopy()
-	// Poll up to ~150ms for the copy to land. Long enough for slow apps to
-	// report a real selection, short enough not to stall when an empty Cmd+C
-	// copies nothing (the no-selection case in non-AX apps).
-	for i := 0; i < 15; i++ {
+	// Poll up to ~400ms for the copy to land. Long enough for slow Electron
+	// fields (Discord, Slack, some browser inputs) to report a real selection,
+	// short enough not to stall noticeably when Cmd+C copies nothing.
+	for i := 0; i < 40; i++ {
 		time.Sleep(10 * time.Millisecond)
 		if clipboardChangeCount() != before {
 			selected := readClipboard()
@@ -664,7 +793,7 @@ func main() {
 
 		// Skip replacement in excluded apps (e.g. IDEs, terminals).
 		app := FrontmostAppID()
-			log.Printf("FrontmostAppID=%q", app)
+		log.Printf("FrontmostAppID=%q", app)
 		if cfg.IsAppExcluded(app) {
 			return
 		}
@@ -755,7 +884,7 @@ func main() {
 					return false
 				}
 				app := FrontmostAppID()
-			log.Printf("FrontmostAppID=%q", app)
+				log.Printf("FrontmostAppID=%q", app)
 				if cfg.IsAppExcluded(app) {
 					return false
 				}
@@ -823,7 +952,7 @@ func main() {
 				}
 				if store != nil {
 					app := FrontmostAppID()
-			log.Printf("FrontmostAppID=%q", app)
+					log.Printf("FrontmostAppID=%q", app)
 					if err := store.Add(app, original); err == nil {
 						log.Printf("Learned exception (Cmd+Z): %q in %q", original, app)
 					}
