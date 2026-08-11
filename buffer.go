@@ -60,10 +60,37 @@ func (b *Buffer) Backspace() {
 	}
 }
 
+// Clear invalidates everything the buffer believes about the caret. It is
+// called exactly when that belief stops holding — a click, an arrow key, a
+// Cmd shortcut — so lastFlushed must go too: otherwise LastWord would keep
+// offering a word the caret has long since left, and the hotkey would
+// backspace over text somewhere else entirely.
 func (b *Buffer) Clear() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.chars = b.chars[:0]
+	b.lastFlushed = b.lastFlushed[:0]
+}
+
+// SetWord makes the buffer report word as the text sitting at the caret, with
+// flushed telling whether a boundary char (usually a space) follows it.
+//
+// Needed after a hotkey conversion rewrites the text through backspaces: our
+// own synthetic keystrokes are filtered out of the hook, so without this the
+// buffer would still hold the PRE-conversion word and the next press would
+// "convert" text that is no longer on screen — retyping the same result
+// instead of switching it back.
+func (b *Buffer) SetWord(word string, flushed bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	runes := []rune(word)
+	if flushed {
+		b.chars = b.chars[:0]
+		b.lastFlushed = append(b.lastFlushed[:0], runes...)
+		return
+	}
+	b.chars = append(b.chars[:0], runes...)
+	b.lastFlushed = b.lastFlushed[:0]
 }
 
 // FlushWord returns the current buffered word and clears the buffer.

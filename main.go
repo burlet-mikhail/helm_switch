@@ -391,6 +391,107 @@ var searchAppBundleIDs = map[string]bool{
 // isSearchApp reports whether app is one of the inline-autocomplete search apps.
 func isSearchApp(app string) bool { return searchAppBundleIDs[app] }
 
+// --- Terminal-aware routing for the Caps Lock hotkey ------------------------
+//
+// A terminal emulator does not implement Option+Shift+Left as "select previous
+// word": xterm.js (VS Code and its forks) and JediTerm (JetBrains) forward it to
+// the shell as the escape sequence ESC [1;4D. With zsh in vi mode the leading
+// ESC leaves insert mode and the trailing `D` runs delete-to-end-of-line, so the
+// last character of the command line disappears and every further keystroke is
+// read as a vi command — the line looks frozen until the user presses Enter.
+// (Reproduced verbatim: typing "привет" then the sequence leaves "приве".)
+//
+// Inside a terminal the only safe editing primitives are backspace and typing,
+// so there we convert the typing buffer instead of synthesising a selection.
+
+// terminalEmulatorAppIDs are apps that are ENTIRELY a terminal emulator — every
+// focused text entry belongs to a shell.
+var terminalEmulatorAppIDs = []string{
+	"com.apple.terminal",
+	"com.googlecode.iterm2",
+	"dev.warp.warp",
+	"com.mitchellh.ghostty",
+	"net.kovidgoyal.kitty",
+	"org.alacritty",
+	"com.github.wez.wezterm",
+	"co.zeit.hyper",
+}
+
+// terminalPanelAppIDs are VS Code and the IDEs built on it, which embed an
+// xterm.js terminal panel next to ordinary inputs (editor, chat, search). They
+// expose no usable Accessibility data — the focused element reads back as
+// role="" with selLen=-1 whether the caret sits in the terminal or in the chat
+// box — so we cannot tell the two apart and must assume the terminal.
+var terminalPanelAppIDs = []string{
+	"com.microsoft.vscode", // also matches VSCodeInsiders / VSCodeExploration
+	"com.vscodium",
+	"com.todesktop", // Cursor ships as com.todesktop.230313mzl4w4u92
+	"com.exafunction.windsurf",
+	"com.codeium.windsurf",
+	"com.google.antigravity",
+	"com.trae",
+}
+
+// capsRoute says how handleCapsLock may obtain the text to convert for the
+// focused app.
+type capsRoute int
+
+const (
+	// capsRouteSelection — a synthetic word selection is safe: read/extend the
+	// selection with Option+Shift+Left and paste the conversion over it.
+	capsRouteSelection capsRoute = iota
+	// capsRouteBufferOnly — the focused entry is a shell. Only the typing
+	// buffer may be used; a paste would insert instead of replacing, because a
+	// terminal selection is not an editable selection.
+	capsRouteBufferOnly
+	// capsRouteBufferOrSelection — the app embeds a terminal but the focus may
+	// equally be a normal input. Prefer the typing buffer (safe in both), and
+	// fall back to an already-existing selection, which we can read with Cmd+C
+	// without any keystroke reaching the shell.
+	capsRouteBufferOrSelection
+)
+
+// routeForCaps picks the conversion strategy for the focused app/role pair.
+func routeForCaps(app, role string) capsRoute {
+	lower := strings.ToLower(app)
+
+	// JetBrains IDEs expose JediTerm as a bare "AXTextArea" while their editor
+	// and plugin fields report the "JavaAxIgnore" role, so the role separates
+	// the terminal panel exactly — only it loses the selection gesture.
+	if strings.HasPrefix(lower, "com.jetbrains.") {
+		if role == "AXTextArea" {
+			return capsRouteBufferOnly
+		}
+		return capsRouteSelection
+	}
+
+	for _, id := range terminalEmulatorAppIDs {
+		if strings.Contains(lower, id) {
+			return capsRouteBufferOnly
+		}
+	}
+	for _, id := range terminalPanelAppIDs {
+		if strings.Contains(lower, id) {
+			return capsRouteBufferOrSelection
+		}
+	}
+	return capsRouteSelection
+}
+
+// lastTypedApp records the app that was frontmost when the typing buffer last
+// grew. The buffer itself is app-agnostic, so without this a word typed in one
+// app could be "corrected" in another — which now matters more than before,
+// because the terminal routes send blind backspaces. Nil until the first
+// keystroke.
+var lastTypedApp atomic.Pointer[string]
+
+// bufferMatchesApp reports whether the typing buffer was filled in app, i.e.
+// whether backspacing over it is safe there.
+func bufferMatchesApp(app string) bool {
+	p := lastTypedApp.Load()
+	return p != nil && *p == app
+}
+
 // isNavigationKey reports whether keycode is an arrow / Home / End / Page key.
 // These move the caret or extend a selection, so the typing buffer no longer
 // reflects what is at the cursor and must be invalidated.
@@ -460,15 +561,42 @@ func handleCapsLock(buf *Buffer) {
 	log.Printf("[caps] start app=%q selLen=%d role=%q subrole=%q desc=%q id=%q",
 		app, selLen, role, subrole, desc, id)
 
-	// JetBrains IDEs (IntelliJ, PhpStorm, GoLand, …) embed JediTerm as their
-	// terminal panel and expose it through AX as a plain "AXTextArea" — while
-	// their actual code editor and plugin fields use the "JavaAxIgnore" role.
-	// Sending Option+Shift+Left into JediTerm doesn't select a word: the OS
-	// forwards it as ^[[1;4D, which the shell prints as "[D" garbage. Use the
-	// typing buffer instead — what the user just typed is exactly what we want
-	// to convert — and overwrite it by sending backspaces + the corrected text.
-	if strings.HasPrefix(app, "com.jetbrains.") && role == "AXTextArea" {
-		convertLastWordFromBuffer(bufferedWord, bufferedFlushed, "JetBrains terminal panel")
+	// A terminal is at the caret (JediTerm panel, a VS Code-family terminal, or
+	// a standalone terminal emulator): synthesising a selection would send
+	// ESC[1;4D into the shell instead — see routeForCaps. Convert what the user
+	// just typed, using backspaces, which is the only primitive a shell reads
+	// the way we mean it.
+	if route := routeForCaps(app, role); route != capsRouteSelection {
+		if strings.TrimSpace(bufferedWord) != "" {
+			// The buffer is app-agnostic, so a word typed elsewhere would make
+			// the backspaces eat somebody else's characters.
+			if !bufferMatchesApp(app) {
+				log.Printf("[caps] %s: typing buffer %q belongs to another app, ignoring it",
+					app, bufferedWord)
+			} else {
+				convertLastWordFromBuffer(buf, bufferedWord, bufferedFlushed, "terminal ("+app+")")
+				return
+			}
+		}
+		if route == capsRouteBufferOnly {
+			log.Printf("[caps] %s: no usable typing buffer in a terminal, no-op", app)
+			return
+		}
+		// VS Code-family app with nothing typed since the last click or caret
+		// move: the focus may just as well be the editor or the chat box, so an
+		// already-existing selection is still worth converting. Reading it with
+		// Cmd+C is safe — unlike an arrow gesture it never reaches the shell.
+		if sel := axSelectedText(); sel != "" {
+			log.Printf("[caps] %s: AX read direct selection: %q", app, sel)
+			convertSelectionInPlace(sel)
+			return
+		}
+		if sel := copySelectionViaClipboard(); sel != "" {
+			log.Printf("[caps] %s: clipboard probe returned %q", app, sel)
+			convertSelectionInPlace(sel)
+			return
+		}
+		log.Printf("[caps] %s: no typing buffer and no selection, no-op", app)
 		return
 	}
 
@@ -545,7 +673,7 @@ func handleCapsLock(buf *Buffer) {
 // Caveat: if the user clicked away or moved the caret after typing, the buffer
 // no longer matches what's at the cursor. That's the same trade-off as the
 // auto-convert path and acceptable for a manual hotkey.
-func convertLastWordFromBuffer(word string, hasTrailingSpace bool, reasonForLog string) {
+func convertLastWordFromBuffer(buf *Buffer, word string, hasTrailingSpace bool, reasonForLog string) {
 	if strings.TrimSpace(word) == "" {
 		log.Printf("[caps] %s: empty typing buffer, no-op", reasonForLog)
 		return
@@ -577,7 +705,16 @@ func convertLastWordFromBuffer(word string, hasTrailingSpace bool, reasonForLog 
 		time.Sleep(5 * time.Millisecond)
 	}
 	switchLang()
-	time.Sleep(30 * time.Millisecond)
+
+	// Let every keystroke we just posted reach the event tap before the caller
+	// lowers the `replacing` flag. Otherwise the tail of our own synthetic input
+	// lands in the typing buffer, and whether it does is a race — which is
+	// exactly what made the hotkey convert on some presses and appear dead on
+	// others. Once the queue has drained we state the result outright, so the
+	// next press converts the text that is actually on screen (and thus toggles
+	// back, conversion being a bijection).
+	time.Sleep(80 * time.Millisecond)
+	buf.SetWord(converted, hasTrailingSpace)
 	log.Printf("[caps] %s: %q → %q (trailingSpace=%v)", reasonForLog, word, converted, hasTrailingSpace)
 }
 
@@ -985,7 +1122,11 @@ func main() {
 			return false
 		}
 
-		// Regular char (no Command modifier) — accumulate in buffer.
+		// Regular char (no Command modifier) — accumulate in buffer. Remember
+		// where it was typed so the terminal routes in handleCapsLock don't
+		// backspace over text that belongs to a different app.
+		typedIn := FrontmostAppID()
+		lastTypedApp.Store(&typedIn)
 		buf.Add(char)
 		if tracker != nil {
 			res := tracker.ObserveKey(KeyObservation{Kind: KeyKindChar, Rune: char})
